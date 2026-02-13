@@ -2,9 +2,18 @@
 name = "pravaha"
 version = "0.1.0"
 edition = "2024"
+authors     = ["rhythmcache"]
+description = ""
+repository  = "https://github.com/rhythmcache/pravaha"
+readme      = "README.md"
+license     = "Apache-2.0"
+homepage    = "https://github.com/rhythmcache/pravaha"
+keywords = ["http", "streaming", "file", "range-requests", "cache"]
+categories = ["filesystem", "network-programming", "web-programming::http-client"]
 
 [lib]
 name = "pravaha"
+path = "src/lib.rs"
 
 [dependencies]
 ahash = "0.8.12"
