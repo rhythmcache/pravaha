@@ -1,6 +1,6 @@
 # pravaha
 
-**Pravaha** (प्रवाह - "flow" in Sanskrit) lets you read files from HTTP(S) URLs as if they were local files. It handles chunking, caching, retries, and prefetching.
+**Pravaha** (प्रवाह - "flow" in Sanskrit) lets you read files from HTTP(S) URLs as if they were local files.
 
 ```rust
 use pravaha::open;
