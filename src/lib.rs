@@ -123,3 +123,64 @@ pub use plug::*;
 
 #[cfg(feature = "capi")]
 pub mod ffi;
+
+use std::io::{self, Read, Seek, SeekFrom};
+
+pub struct FileAdapter {
+    inner: Box<dyn File>,
+}
+
+impl FileAdapter {
+    pub fn new(file: Box<dyn File>) -> Self {
+        Self { inner: file }
+    }
+
+    pub fn into_inner(self) -> Box<dyn File> {
+        self.inner
+    }
+}
+
+impl From<Box<dyn File>> for FileAdapter {
+    fn from(file: Box<dyn File>) -> Self {
+        Self::new(file)
+    }
+}
+
+impl Read for FileAdapter {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).map_err(io::Error::other)
+    }
+}
+
+impl Seek for FileAdapter {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::Current(offset) => {
+                let current = self.inner.tell();
+                if offset >= 0 {
+                    current.saturating_add(offset as u64)
+                } else {
+                    current.saturating_sub((-offset) as u64)
+                }
+            }
+            SeekFrom::End(offset) => {
+                let size = self.inner.size().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Cannot seek from end without known file size",
+                    )
+                })?;
+
+                if offset >= 0 {
+                    size.saturating_add(offset as u64)
+                } else {
+                    size.saturating_sub((-offset) as u64)
+                }
+            }
+        };
+
+        self.inner.seek(new_pos).map_err(io::Error::other)?;
+        Ok(new_pos)
+    }
+}
