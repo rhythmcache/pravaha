@@ -77,6 +77,9 @@ let mut archive = ZipArchive::new(FileAdapter::new(file))?;
 
 Build with `--features capi` to get C bindings.
 
+For detailed C API usage, see [docs/c.md](docs/c.md).
+
+
 
 Example usage:
 
