@@ -3,7 +3,7 @@
 **Pravaha** (प्रवाह - "flow" in Sanskrit) lets you read files from HTTP(S) URLs as if they were local files.
 
 ```rust
-use pravaha::open;
+use pravaha::{open, File};
 
 let mut file = open("https://example.com/data.bin", "r")?;
 let mut buffer = vec![0u8; 1024];
@@ -33,7 +33,7 @@ You have a large file on a server and don't want to download all of it. Maybe yo
 Basic:
 
 ```rust
-use pravaha::open;
+use pravaha::{open, File};
 
 let mut file = open("https://example.com/file.bin", "r")?;
 let mut buffer = vec![0u8; 4096];
@@ -48,7 +48,7 @@ if let Some(size) = file.size() {
 With custom configuration:
 
 ```rust
-use pravaha::HttpFileSystem;
+use pravaha::{HttpFileSystem, FileSystem};
 use std::time::Duration;
 
 let fs = HttpFileSystem::builder()
@@ -61,6 +61,18 @@ let fs = HttpFileSystem::builder()
 let mut file = fs.open("https://example.com/big-file.bin", "r")?;
 ```
 
+## Using with standard I/O libraries
+
+To use with libraries that require `std::io::Read` and `Seek`, wrap the file in `FileAdapter`:
+
+```rust
+use pravaha::{open, FileAdapter};
+use zip::ZipArchive;
+
+let file = open("https://example.com/archive.zip", "r")?;
+let mut archive = ZipArchive::new(FileAdapter::new(file))?;
+```
+
 ## C API
 
 Build with `--features capi` to get C bindings.
@@ -71,7 +83,7 @@ Example usage:
 ```c
 #include "pravaha.h"
 
-pravaha_file_t* file = pravaha_open_url("https://example.com/data.bin", "r");
+PravahaFile* file = pravaha_open_url("https://example.com/data.bin", "r");
 if (!file) {
     fprintf(stderr, "Error: %s\n", pravaha_last_error());
     return 1;
@@ -88,7 +100,7 @@ pravaha_file_close(file);
 - LRU cache for previously read chunks
 - Background prefetching for sequential reads (auto-disables for random access)
 - Exponential backoff retry on network failures
-- Implements standard `Read` and `Seek` traits
+- Concrete file implementations (`HttpFile`) implement `std::io::Read` and `Seek` traits
 
 ## Requirements
 

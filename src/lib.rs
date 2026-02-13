@@ -33,7 +33,23 @@
 //! - Caches chunks you've already read (in case you seek backwards)
 //! - Prefetches the next chunk in the background for sequential reads
 //! - Retries failed requests with exponential backoff
-//! - Works with Rust's standard `Read` and `Seek` traits
+//! - Concrete file implementations (`HttpFile`) implement `std::io::Read` and `Seek` traits
+//!
+//! ## Using with standard I/O libraries
+//!
+//! The `open()` function returns `Box<dyn File>`, which uses the `File` trait from this crate.
+//! To use with libraries that require `std::io::Read` and `Seek`, wrap it in `FileAdapter`:
+//!
+//! ```rust
+//! use pravaha::{open, FileAdapter};
+//! use zip::ZipArchive;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let file = open("https://example.com/archive.zip", "r")?;
+//! let mut archive = ZipArchive::new(FileAdapter::new(file))?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! ## Tuning the behavior
 //!
@@ -91,6 +107,10 @@
 //!
 //! The library needs servers to support HTTP Range requests (most do). If a server returns 200
 //! instead of 206 for a range request, you'll get an error.
+//!
+//! The `size()` method returns `None` for streams without a known content-length or when the
+//! server doesn't provide this information. You can still read from such files, but you won't
+//! know their size in advance and cannot seek from the end.
 //!
 //! ## Errors
 //!
