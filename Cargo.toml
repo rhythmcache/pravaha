@@ -14,6 +14,7 @@ categories = ["filesystem", "network-programming", "web-programming::http-client
 [lib]
 name = "pravaha"
 path = "src/lib.rs"
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 ahash = "0.8.12"
