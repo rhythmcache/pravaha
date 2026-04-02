@@ -171,17 +171,17 @@ impl FetchEngine {
         };
 
         // Fast path already in completed cache.
-        if let Ok(mut lru) = self.lru.lock() {
-            if let Some(data) = lru.get(&key) {
+        if let Ok(mut lru) = self.lru.lock()
+            && let Some(data) = lru.get(&key) {
                 return futures::future::ready(Ok(data)).boxed().shared();
             }
-        }
 
         // In-flight deduplication.
         use dashmap::mapref::entry::Entry;
 
-        let shared = match self.in_flight.entry(key.clone()) {
-            Entry::Occupied(e) => return e.get().clone(),
+        
+        match self.in_flight.entry(key.clone()) {
+            Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(v) => {
                 // Build the future only if we won the race.
                 let transport = Arc::clone(&self.transport);
@@ -234,8 +234,7 @@ impl FetchEngine {
                 v.insert(shared.clone());
                 shared
             }
-        };
-        shared
+        }
     }
 
     /// Kick off prefetch futures for the next `n` chunks without awaiting them.
@@ -415,16 +414,15 @@ impl File for HttpFile {
             self.file_offset += to_copy as u64;
 
             // Check EOF against file size if known.
-            if let Some(Some(size)) = self.cached_size.get() {
-                if self.file_offset >= size {
+            if let Some(Some(size)) = self.cached_size.get()
+                && self.file_offset >= size {
                     self.eof_reached = true;
                     break;
                 }
-            }
         }
 
         if total_read > 0 {
-            let sequential = self.last_read_end.map_or(true, |end| start_offset == end);
+            let sequential = self.last_read_end.is_none_or(|end| start_offset == end);
             self.last_read_end = Some(self.file_offset);
 
             if sequential {
