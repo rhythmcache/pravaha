@@ -26,15 +26,15 @@ Default HTTP backend is `curl`. To use `reqwest` instead:
 
 ```toml
 [dependencies]
-pravaha = { version = "0.1.0", default-features = false, features = ["reqwest"] }
+pravaha = { version = "0.1.1", default-features = false, features = ["reqwest"] }
 ```
 
 ## Feature flags
 
 | Feature   | Default | Description                                               |
 |-----------|---------|-----------------------------------------------------------|
-| `curl`    | ✓       | libcurl backend (blocking, executed via `spawn_blocking`) |
-| `reqwest` |         | async reqwest backend (don't enable both)                 |
+| `curl`    |         | libcurl backend (blocking, executed via `spawn_blocking`) |
+| `reqwest` | ✓       | async reqwest backend (don't enable both)                 |
 | `capi`    |         | C ABI bindings + header generation                        |
 
 ## Usage
