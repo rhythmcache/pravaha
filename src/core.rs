@@ -32,12 +32,13 @@ impl From<io::Error> for FsError {
 
 pub type Result<T> = std::result::Result<T, FsError>;
 
-/// Abstract file interface — intentionally sync for public API stability.
-pub trait File: Send {
+/// Abstract file interface  intentionally sync for public API stability.
+pub trait File: Send + Sync {
     /// Read up to buf.len() bytes into buf.
     /// Returns number of bytes read (0 = EOF).
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 
+    /// Stateless read: does not modify cursor.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
 
     /// Seek to absolute position.
@@ -50,7 +51,6 @@ pub trait File: Send {
     fn eof(&self) -> bool;
 
     /// Get file size if available.
-    /// Returns None for streams or when server omits Content-Length.
     fn size(&self) -> Option<u64> {
         None
     }
@@ -65,7 +65,7 @@ pub enum OpenMode {
 }
 
 pub trait FileSystem: Send + Sync {
-    fn open(&self, path: &str, mode: OpenMode) -> Result<Box<dyn File>>;
+    fn open(&self, path: &str, mode: OpenMode) -> Result<Box<dyn File + Send + Sync>>;
 }
 
 /// Create a filesystem for the given URL.
@@ -78,7 +78,7 @@ pub fn create(url: &str) -> Result<Box<dyn FileSystem>> {
 }
 
 /// Open a file directly.
-pub fn open(url: &str, mode: OpenMode) -> Result<Box<dyn File>> {
+pub fn open(url: &str, mode: OpenMode) -> Result<Box<dyn File + Send + Sync>> {
     let fs = create(url)?;
     fs.open(url, mode)
 }
