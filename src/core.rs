@@ -38,6 +38,8 @@ pub trait File: Send {
     /// Returns number of bytes read (0 = EOF).
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+
     /// Seek to absolute position.
     fn seek(&mut self, pos: u64) -> Result<()>;
 

@@ -130,6 +130,33 @@ pub unsafe extern "C" fn pravaha_create(url: *const c_char) -> *mut PravahaFiles
     })
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pravaha_read_at(
+    file: *const PravahaFile, // const: no cursor mutation
+    offset: u64,
+    buffer: *mut c_void,
+    size: size_t,
+) -> ssize_t {
+    clear_last_error();
+
+    if file.is_null() || buffer.is_null() {
+        set_last_error_str("Null pointer argument");
+        return -1;
+    }
+
+    let buf = unsafe { slice::from_raw_parts_mut(buffer as *mut u8, size) };
+
+    ffi_catch(-1, move || {
+        match unsafe { &*file }.inner.read_at(offset, buf) {
+            Ok(n) => n as ssize_t,
+            Err(e) => {
+                set_last_error(&e);
+                -1
+            }
+        }
+    })
+}
+
 /// Free a filesystem handle.
 ///
 /// # Safety

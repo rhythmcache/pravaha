@@ -469,6 +469,40 @@ impl File for HttpFile {
         Ok(total_read)
     }
 
+    fn read_at(&self, mut offset: u64, buf: &mut [u8]) -> Result<usize> {
+        if self.closed {
+            return Err(FsError::FileClosed);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0;
+
+        while total < buf.len() {
+            let chunk_start = self.chunk_start(offset);
+            let chunk = self.fetch_chunk(chunk_start)?;
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            let inner = (offset - chunk_start) as usize;
+            if inner >= chunk.len() {
+                break;
+            }
+
+            let available = &chunk[inner..];
+            let to_copy = available.len().min(buf.len() - total);
+            buf[total..total + to_copy].copy_from_slice(&available[..to_copy]);
+
+            total += to_copy;
+            offset += to_copy as u64;
+        }
+
+        Ok(total)
+    }
+
     fn seek(&mut self, pos: u64) -> Result<()> {
         if self.closed {
             return Err(FsError::FileClosed);
