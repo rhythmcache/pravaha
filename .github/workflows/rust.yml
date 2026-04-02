@@ -3,20 +3,61 @@ name: Rust
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "build.rs"
   pull_request:
     branches: [ "main" ]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "build.rs"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install libcurl (for curl feature)
+        run: sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (curl)
+        run: cargo clippy --all-targets --no-default-features --features curl -- -D warnings
+
+      - name: Build (curl)
+        run: cargo build --verbose --no-default-features --features curl
+
+      - name: Build (reqwest)
+        run: cargo build --verbose --no-default-features --features reqwest
+
+      - name: Build (curl,capi)
+        run: cargo build --verbose --no-default-features --features curl,capi
+
+      - name: Test (curl)
+        run: cargo test --verbose --no-default-features --features curl
+
+      - name: Test (reqwest)
+        run: cargo test --verbose --no-default-features --features reqwest
