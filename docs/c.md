@@ -8,58 +8,81 @@ Build with `--features capi` to get C bindings.
 #include "pravaha.h"
 ```
 
-## Types
+## Blocking behaviour
 
-### `PravahaFilesystem`
-Opaque handle to a filesystem instance.
+All operations are blocking. Internally the library uses asynchronous I/O (Tokio), but the C API presents a fully synchronous interface — every call blocks the calling thread until the operation completes or fails.
 
-### `PravahaFile`
-Opaque handle to an open file.
-
-### `PravahaErrorCode`
-Error codes returned by functions:
-```c
-enum PravahaErrorCode {
-    PRAVAHA_SUCCESS = 0,
-    PRAVAHA_NETWORK = 1,
-    PRAVAHA_PROTOCOL = 2,
-    PRAVAHA_IO = 3,
-    PRAVAHA_FILE_CLOSED = 4,
-    PRAVAHA_UNSUPPORTED_PROTOCOL = 5,
-    PRAVAHA_INVALID_ARGUMENT = 6,
-    PRAVAHA_UNKNOWN = 99
-};
-```
-
-## Functions
-
-### Library Version
+## ABI Versioning
 
 ```c
-const char* pravaha_version(void);
+#define PRAVAHA_ABI_VERSION 1
 ```
-Returns a pointer to a static string containing the library version (e.g., "0.1.0").
 
-**Returns:** Pointer to static version string (never NULL).
+Increment when the ABI changes in a backwards-incompatible way. Consumers can guard against version mismatches at compile time:
+
+```c
+#if PRAVAHA_ABI_VERSION != 1
+#  error "Unexpected pravaha ABI version"
+#endif
+```
 
 ---
 
-### Error Handling
+## Types
+
+### `pravaha_filesystem_t`
+Opaque handle to a filesystem instance. Can be shared between threads.
+
+### `pravaha_file_t`
+Opaque handle to an open file. Must not be used from multiple threads simultaneously, and functions are not reentrant for the same handle (e.g. do not call back into the API with the same handle from within a signal handler or callback).
+
+### `PravahaErrorCode`
+Error codes returned by functions:
+
+```c
+enum PravahaErrorCode {
+    PRAVAHA_SUCCESS              = 0,   /* Operation succeeded              */
+    PRAVAHA_NETWORK              = 1,   /* TCP / DNS / connection error     */
+    PRAVAHA_PROTOCOL             = 2,   /* HTTP protocol violation          */
+    PRAVAHA_IO                   = 3,   /* Local I/O error                  */
+    PRAVAHA_FILE_CLOSED          = 4,   /* Operation on a closed file       */
+    PRAVAHA_UNSUPPORTED_PROTOCOL = 5,   /* Non-HTTP(S) URL                  */
+    PRAVAHA_INVALID_ARGUMENT     = 6,   /* NULL pointer or bad argument     */
+    PRAVAHA_RATE_LIMITED         = 7,   /* Server returned 429 / 503        */
+    PRAVAHA_PANIC                = 8,   /* Internal panic (please report)   */
+    PRAVAHA_UNKNOWN              = 99
+};
+```
+
+### Panic fallback behaviour
+
+If an internal panic occurs, it is caught at the FFI boundary and converted to an error rather than unwinding into C (which would be undefined behaviour). In that case:
+
+- Functions returning pointers return `NULL`
+- `pravaha_read` returns `-1`
+- All other functions return `PRAVAHA_PANIC`
+
+In all cases `pravaha_last_error()` is set to a descriptive message. If you encounter `PRAVAHA_PANIC` please report it as a bug.
+
+---
+
+## Error Handling
 
 ```c
 const char* pravaha_last_error(void);
 ```
+
 Returns the last error message for the current thread.
 
-**Returns:** 
-- Pointer to error string if an error occurred
-- NULL if no error
+**Returns:**
+- Pointer to a null-terminated error string if an error occurred
+- `NULL` if no error
 
-**Note:** The returned string is valid until the next pravaha function call on the same thread.
+**Note:** The pointer is valid until the next pravaha call on the same thread. Do not free it.
 
 **Example:**
 ```c
-PravahaFile* file = pravaha_open_url(url, "r");
+pravaha_file_t* file = pravaha_open_url(url, "r");
 if (!file) {
     fprintf(stderr, "Error: %s\n", pravaha_last_error());
 }
@@ -67,27 +90,36 @@ if (!file) {
 
 ---
 
-### Filesystem Operations
+## Library Version
 
 ```c
-PravahaFilesystem* pravaha_create(const char* url);
+const char* pravaha_version(void);
 ```
-Creates a filesystem for the given URL.
+
+**Returns:** Pointer to a static version string (e.g. `"0.1.0"`). Never NULL.
+
+---
+
+## Filesystem Operations
+
+```c
+pravaha_filesystem_t* pravaha_create(const char* url);
+```
+
+Creates a filesystem handle for the given base URL.
 
 **Parameters:**
-- `url` - Null-terminated URL string (must start with http:// or https://)
+- `url` — Null-terminated URL string (must start with `http://` or `https://`)
 
-**Returns:**
-- Pointer to filesystem handle on success
-- NULL on error (call `pravaha_last_error()` for details)
+**Returns:** Handle on success, `NULL` on error.
 
-**Note:** Caller must free the returned pointer with `pravaha_filesystem_free()`.
+**Note:** Caller must free with `pravaha_filesystem_free()`.
 
 **Example:**
 ```c
-PravahaFilesystem* fs = pravaha_create("https://example.com");
+pravaha_filesystem_t* fs = pravaha_create("https://example.com");
 if (!fs) {
-    fprintf(stderr, "Failed to create filesystem: %s\n", pravaha_last_error());
+    fprintf(stderr, "Failed: %s\n", pravaha_last_error());
     return 1;
 }
 ```
@@ -95,68 +127,53 @@ if (!fs) {
 ---
 
 ```c
-void pravaha_filesystem_free(PravahaFilesystem* fs);
+void pravaha_filesystem_free(pravaha_filesystem_t* fs);
 ```
-Frees a filesystem handle.
 
-**Parameters:**
-- `fs` - Filesystem handle (can be NULL)
+Frees a filesystem handle. Passing `NULL` is safe and a no-op.
 
-**Warning:**
-- The handle must not be used or freed again after this call
-- Passing the same handle twice to `pravaha_filesystem_free()` results in undefined behavior
-- Double-free will cause crashes
+**Warning:** Do not use or free the handle again after this call (double-free = undefined behaviour).
 
 ---
 
-### File Operations
+## File Operations
 
 ```c
-PravahaFile* pravaha_open(PravahaFilesystem* fs, 
-                          const char* path, 
-                          const char* mode);
+pravaha_file_t* pravaha_open(pravaha_filesystem_t* fs,
+                              const char* path,
+                              const char* mode);
 ```
+
 Opens a file using an existing filesystem handle.
 
 **Parameters:**
-- `fs` - Valid filesystem handle
-- `path` - Null-terminated path/URL string
-- `mode` - File mode ("r" or "rb" for read-only)
+- `fs` — Valid filesystem handle
+- `path` — Path or URL resolved relative to the filesystem base URL
+- `mode` — `"r"` or `"rb"` (read-only; write modes are not supported)
 
-**Returns:**
-- Pointer to file handle on success
-- NULL on error (call `pravaha_last_error()` for details)
+**Returns:** Handle on success, `NULL` on error.
 
-**Note:** Caller must free the returned pointer with `pravaha_file_close()`.
-
-**Example:**
-```c
-PravahaFile* file = pravaha_open(fs, "https://example.com/data.bin", "r");
-if (!file) {
-    fprintf(stderr, "Failed to open file: %s\n", pravaha_last_error());
-}
-```
+**Note:** Caller must free with `pravaha_file_close()`.
 
 ---
 
 ```c
-PravahaFile* pravaha_open_url(const char* url, const char* mode);
+pravaha_file_t* pravaha_open_url(const char* url, const char* mode);
 ```
-Opens a file directly without creating a filesystem handle first.
+
+Opens a file directly without a separate filesystem handle.
 
 **Parameters:**
 - `url` - Null-terminated URL string
-- `mode` - File mode ("r" or "rb" for read-only)
+- `mode` - `"r"` or `"rb"`
 
-**Returns:**
-- Pointer to file handle on success
-- NULL on error (call `pravaha_last_error()` for details)
+**Returns:** Handle on success, `NULL` on error.
 
-**Note:** Caller must free the returned pointer with `pravaha_file_close()`.
+**Note:** Caller must free with `pravaha_file_close()`.
 
 **Example:**
 ```c
-PravahaFile* file = pravaha_open_url("https://example.com/data.bin", "r");
+pravaha_file_t* file = pravaha_open_url("https://example.com/data.bin", "r");
 if (!file) {
     fprintf(stderr, "Error: %s\n", pravaha_last_error());
     return 1;
@@ -166,52 +183,56 @@ if (!file) {
 ---
 
 ```c
-ssize_t pravaha_read(PravahaFile* file, void* buffer, size_t size);
+void pravaha_file_close(pravaha_file_t* file);
 ```
-Reads up to `size` bytes from the file into `buffer`.
 
-**Parameters:**
-- `file` - Valid file handle
-- `buffer` - Buffer to read data into (must be at least `size` bytes)
-- `size` - Maximum number of bytes to read
+Closes a file and frees its resources. Passing `NULL` is safe and a no-op.
 
-**Returns:**
-- Number of bytes read (0 indicates EOF)
-- -1 on error (call `pravaha_last_error()` for details)
-
-**Note:** Returns a signed integer (`ssize_t` on POSIX systems, `isize` equivalent on Windows).
+**Warning:** Do not use or free the handle again after this call.
 
 **Example:**
 ```c
-char buffer[1024];
-ssize_t n = pravaha_read(file, buffer, sizeof(buffer));
-if (n < 0) {
-    fprintf(stderr, "Read error: %s\n", pravaha_last_error());
-} else if (n == 0) {
-    printf("End of file\n");
-} else {
-    printf("Read %zd bytes\n", n);
-}
+pravaha_file_close(file);
+file = NULL;  /* prevent accidental reuse */
+```
+
+---
+
+## File I/O
+
+```c
+ssize_t pravaha_read(pravaha_file_t* file, void* buffer, size_t size);
+```
+
+Reads up to `size` bytes into `buffer`. Blocks until data is available.
+
+**Returns:**
+- `> 0` — number of bytes read
+- `0` — end of file
+- `-1` — error (call `pravaha_last_error()`)
+
+**Example:**
+```c
+char buf[4096];
+ssize_t n = pravaha_read(file, buf, sizeof(buf));
+if (n < 0)       fprintf(stderr, "Read error: %s\n", pravaha_last_error());
+else if (n == 0) printf("EOF\n");
+else             printf("Read %lld bytes\n", (long long)n);
 ```
 
 ---
 
 ```c
-int pravaha_seek(PravahaFile* file, uint64_t pos);
+int pravaha_seek(pravaha_file_t* file, uint64_t pos);
 ```
-Seeks to an absolute position in the file.
 
-**Parameters:**
-- `file` - Valid file handle
-- `pos` - Absolute byte position to seek to
+Seeks to an absolute byte position. Unlike local file I/O, seeking may trigger additional HTTP range requests and is not constant-time.
 
-**Returns:**
-- `PRAVAHA_SUCCESS` (0) on success
-- Error code from `PravahaErrorCode` enum on failure
+**Returns:** `PRAVAHA_SUCCESS` (0) on success, or a `PravahaErrorCode` on failure.
 
 **Example:**
 ```c
-if (pravaha_seek(file, 1000) != PRAVAHA_SUCCESS) {
+if (pravaha_seek(file, 65536) != PRAVAHA_SUCCESS) {
     fprintf(stderr, "Seek error: %s\n", pravaha_last_error());
 }
 ```
@@ -219,48 +240,48 @@ if (pravaha_seek(file, 1000) != PRAVAHA_SUCCESS) {
 ---
 
 ```c
-uint64_t pravaha_tell(const PravahaFile* file);
+int pravaha_tell(const pravaha_file_t* file, uint64_t* out_pos);
 ```
-Gets the current position in the file.
+
+Gets the current byte position.
 
 **Parameters:**
-- `file` - Valid file handle
+- `file` — Valid file handle
+- `out_pos` — Output: receives the current position on success; unchanged on failure
 
-**Returns:**
-- Current byte position
-- 0 if file is invalid (error set via `pravaha_last_error()`)
-
-**Note:** Since 0 is also a valid position, callers should check `pravaha_last_error()` if 0 is unexpected.
+**Returns:** `PRAVAHA_SUCCESS` on success, or a `PravahaErrorCode` on failure.
 
 **Example:**
 ```c
-uint64_t pos = pravaha_tell(file);
-printf("Current position: %lu\n", pos);
+uint64_t pos;
+if (pravaha_tell(file, &pos) == PRAVAHA_SUCCESS) {
+    printf("Position: %" PRIu64 "\n", pos);
+}
 ```
 
 ---
 
 ```c
-uint64_t pravaha_size(const PravahaFile* file, int* has_size);
+int pravaha_size(const pravaha_file_t* file, uint64_t* out_size, int* has_size);
 ```
-Gets the file size if available.
+
+Gets the file size if the server provided a `Content-Length`. This may perform a network request (HTTP HEAD) if the size has not been cached yet.
 
 **Parameters:**
-- `file` - Valid file handle
-- `has_size` - Output parameter: set to 1 if size is available, 0 otherwise
+- `file` — Valid file handle
+- `out_size` — Output: receives the file size in bytes when `*has_size == 1`
+- `has_size` — Output: set to `1` if size is known, `0` otherwise
 
-**Returns:**
-- File size in bytes if available
-- 0 if size is not available or on error
+**Returns:** `PRAVAHA_SUCCESS` on success, or a `PravahaErrorCode` on failure.
 
-**Note:** Check `has_size` to determine if the returned size is valid. Streams and chunked responses may not have a known size.
+**Note:** Streams and chunked-transfer responses may not have a known size.
 
 **Example:**
 ```c
+uint64_t size;
 int has_size;
-uint64_t size = pravaha_size(file, &has_size);
-if (has_size) {
-    printf("File size: %lu bytes\n", size);
+if (pravaha_size(file, &size, &has_size) == PRAVAHA_SUCCESS && has_size) {
+    printf("File size: %" PRIu64 " bytes\n", size);
 } else {
     printf("File size unknown\n");
 }
@@ -269,112 +290,84 @@ if (has_size) {
 ---
 
 ```c
-int pravaha_eof(const PravahaFile* file);
+int pravaha_eof(const pravaha_file_t* file);
 ```
-Checks if the file is at end-of-file.
 
-**Parameters:**
-- `file` - Valid file handle
+Checks whether the read position is at end-of-file.
 
 **Returns:**
-- 1 if at EOF
-- 0 otherwise
+- `1` if at EOF
+- `0` if not at EOF
 
-**Example:**
-```c
-if (pravaha_eof(file)) {
-    printf("Reached end of file\n");
-}
-```
-
----
-
-```c
-void pravaha_file_close(PravahaFile* file);
-```
-Closes a file and frees its resources.
-
-**Parameters:**
-- `file` - File handle (can be NULL)
-
-**Warning:** 
-- The handle must not be used or freed again after this call
-- Passing the same handle twice to `pravaha_file_close()` results in undefined behavior
-- Double-free will cause crashes
-
-**Example:**
-```c
-pravaha_file_close(file);
-file = NULL;  // Good practice to prevent accidental reuse
-```
+If `file` is `NULL`, returns `0` and sets the last error. Call `pravaha_last_error()` to distinguish a genuine not-EOF result from a null-pointer error.
 
 ---
 
 ## Complete Example
 
 ```c
+#include <inttypes.h>
 #include <stdio.h>
-#include <pravaha.h>
+#include "pravaha.h"
 
 int main(void) {
-    // Print library version
-    printf("Pravaha version: %s\n", pravaha_version());
-    
-    // Open a file
-    PravahaFile* file = pravaha_open_url("https://example.com/data.bin", "r");
+    printf("pravaha %s (ABI %d)\n", pravaha_version(), PRAVAHA_ABI_VERSION);
+
+    pravaha_file_t* file = pravaha_open_url("https://example.com/data.bin", "r");
     if (!file) {
-        fprintf(stderr, "Failed to open: %s\n", pravaha_last_error());
+        fprintf(stderr, "Open failed: %s\n", pravaha_last_error());
         return 1;
     }
-    
-    // Get file size
+
+    /* File size (may perform a HEAD request) */
+    uint64_t size;
     int has_size;
-    uint64_t size = pravaha_size(file, &has_size);
-    if (has_size) {
-        printf("File size: %lu bytes\n", size);
-    }
-    
-    // Read some data
-    char buffer[1024];
-    ssize_t n = pravaha_read(file, buffer, sizeof(buffer));
+    if (pravaha_size(file, &size, &has_size) == PRAVAHA_SUCCESS && has_size)
+        printf("Size: %" PRIu64 " bytes\n", size);
+
+    /* Read */
+    char buf[4096];
+    ssize_t n = pravaha_read(file, buf, sizeof(buf));
     if (n < 0) {
         fprintf(stderr, "Read error: %s\n", pravaha_last_error());
         pravaha_file_close(file);
         return 1;
     }
-    printf("Read %zd bytes\n", n);
-    
-    // Seek to position
-    if (pravaha_seek(file, 1000) != PRAVAHA_SUCCESS) {
+    printf("Read %lld bytes\n", (long long)n);
+
+    /* Seek (may trigger HTTP range request) */
+    if (pravaha_seek(file, 65536) != PRAVAHA_SUCCESS)
         fprintf(stderr, "Seek error: %s\n", pravaha_last_error());
-    }
-    
-    // Get current position
-    uint64_t pos = pravaha_tell(file);
-    printf("Current position: %lu\n", pos);
-    
-    // Check EOF
-    if (pravaha_eof(file)) {
+
+    /* Tell */
+    uint64_t pos;
+    if (pravaha_tell(file, &pos) == PRAVAHA_SUCCESS)
+        printf("Position: %" PRIu64 "\n", pos);
+
+    /* EOF check */
+    if (pravaha_eof(file))
         printf("At end of file\n");
-    }
-    
-    // Clean up
+
     pravaha_file_close(file);
-    
     return 0;
 }
 ```
 
+---
+
 ## Thread Safety
 
-- Functions are thread-safe as long as individual `PravahaFile` handles are not used concurrently from multiple threads
-- Error messages are stored per-thread
-- `PravahaFile` handles should not be shared between threads
-- `PravahaFilesystem` handles can be safely shared between threads
+- Each `pravaha_file_t` handle must be used from only one thread at a time.
+- Functions are not reentrant for the same handle.
+- `pravaha_filesystem_t` handles are safe to share across threads.
+- Error strings are stored in thread-local storage - `pravaha_last_error()` is always thread-safe.
 
 ## Memory Management
 
-- Caller must free filesystem handles with `pravaha_filesystem_free()`
-- Caller must free file handles with `pravaha_file_close()`
-- Error strings are managed internally and should not be freed
-- NULL handles are safe to pass to cleanup functions
+| What                    | How to free                  |
+|-------------------------|------------------------------|
+| `pravaha_filesystem_t*` | `pravaha_filesystem_free()`  |
+| `pravaha_file_t*`       | `pravaha_file_close()`       |
+| Error strings           | Do **not** free — managed internally |
+
+Passing `NULL` to either free function is safe and a no-op.
