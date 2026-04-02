@@ -52,7 +52,10 @@ fn generate_c_header() {
              */",
         )
         .with_after_include(
-            "#include <stdint.h>\n\
+            "/** Increment when the ABI changes in a backwards-incompatible way. */\n\
+             #define PRAVAHA_ABI_VERSION 1\n\
+             \n\
+             #include <stdint.h>\n\
              #include <stddef.h>\n\
              \n\
              #ifdef _WIN32\n\
