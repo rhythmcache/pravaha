@@ -19,7 +19,7 @@ All operations are synchronous from the caller's perspective. Internally Pravaha
 
 ```toml
 [dependencies]
-pravaha = "0.1.0"
+pravaha = "0.1.1"
 ```
 
 Default HTTP backend is `curl`. To use `reqwest` instead:
