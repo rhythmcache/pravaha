@@ -2,14 +2,18 @@
 name = "pravaha"
 version = "0.1.0"
 edition = "2024"
-authors     = ["rhythmcache"]
+authors = ["rhythmcache"]
 description = "Pravaha lets you read files from HTTP(S) URLs as if they were local files."
-repository  = "https://github.com/rhythmcache/pravaha"
-readme      = "README.md"
-license     = "Apache-2.0"
-homepage    = "https://github.com/rhythmcache/pravaha"
+repository = "https://github.com/rhythmcache/pravaha"
+readme = "README.md"
+license = "Apache-2.0"
+homepage = "https://github.com/rhythmcache/pravaha"
 keywords = ["http", "streaming", "file", "range-requests", "cache"]
-categories = ["filesystem", "network-programming", "web-programming::http-client"]
+categories = [
+  "filesystem",
+  "network-programming",
+  "web-programming::http-client",
+]
 
 [lib]
 name = "pravaha"
@@ -23,7 +27,12 @@ libc = "0.2.184"
 lru = "0.16.3"
 reqwest = { version = "0.13.2", features = ["stream"], optional = true }
 thiserror = "2.0.18"
-tokio       = { version = "1.50", features = ["rt-multi-thread", "time", "sync", "macros"] }
+tokio = { version = "1.50", features = [
+  "rt-multi-thread",
+  "time",
+  "sync",
+  "macros",
+] }
 dashmap = "6.1.0"
 async-trait = "0.1.89"
 futures = "0.3.32"
