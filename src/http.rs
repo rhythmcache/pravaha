@@ -1,7 +1,6 @@
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -342,7 +341,7 @@ pub struct HttpFile {
     eof_reached: bool,
     closed: bool,
     /// Cached result of HEAD request.
-    cached_size: Cell<Option<Option<u64>>>,
+    cached_size: RwLock<Option<Option<u64>>>,
     /// Whether the last read was sequential (used for prefetch decisions).
     last_read_end: Option<u64>,
     cancel_token: CancellationToken,
@@ -357,7 +356,7 @@ impl HttpFile {
             file_offset: 0,
             eof_reached: false,
             closed: false,
-            cached_size: Cell::new(None),
+            cached_size: RwLock::new(None),
             last_read_end: None,
             cancel_token: CancellationToken::new(),
         }
@@ -375,15 +374,30 @@ impl HttpFile {
     }
 
     fn fetch_size(&self) -> Option<u64> {
-        if let Some(val) = self.cached_size.get() {
+        if let Some(val) = *self.cached_size.read().unwrap() {
             return val;
         }
+
+        // Potential race here where multiple threads might call content_length.
+        // It's not a safety issue, but we can minimize redundant writes.
         match block_sync(&self.rt, self.engine.content_length(self.url.as_ref())) {
             Ok(Ok(val)) => {
-                self.cached_size.set(Some(val));
+                let mut guard = self.cached_size.write().unwrap();
+                if let Some(existing) = *guard {
+                    return existing;
+                }
+                *guard = Some(val);
                 val
             }
-            Ok(Err(_)) => None, // server gave no Content-Length, that's fine
+            Ok(Err(_)) => {
+                let mut guard = self.cached_size.write().unwrap();
+                if let Some(existing) = *guard {
+                    return existing;
+                }
+                // cache the fact that server gave no Content-Length
+                *guard = Some(None);
+                None
+            }
             Err(e) => {
                 // runtime misconfiguration surface during dev, silent in release
                 #[cfg(debug_assertions)]
@@ -443,7 +457,7 @@ impl File for HttpFile {
             self.file_offset += to_copy as u64;
 
             // Check EOF against file size if known.
-            if let Some(Some(size)) = self.cached_size.get()
+            if let Some(Some(size)) = *self.cached_size.read().unwrap()
                 && self.file_offset >= size
             {
                 self.eof_reached = true;
@@ -578,7 +592,7 @@ impl Default for HttpFileSystem {
 }
 
 impl FileSystem for HttpFileSystem {
-    fn open(&self, url: &str, mode: OpenMode) -> Result<Box<dyn File>> {
+    fn open(&self, url: &str, mode: OpenMode) -> Result<Box<dyn File + Send + Sync>> {
         match mode {
             OpenMode::Read => Ok(Box::new(HttpFile::new(
                 Arc::from(url),

@@ -15,7 +15,7 @@
 //!
 //! ## Basic usage
 //!
-//! ```rust
+//! ```rust,no_run
 //! use pravaha::{open, File, OpenMode};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,9 +38,9 @@
 //! `open()` returns `Box<dyn File>`.  Wrap it in `FileAdapter` to get
 //! `std::io::Read + Seek`:
 //!
-//! ```rust
+//! ```rust,ignore
 //! use pravaha::{open, FileAdapter, OpenMode};
-//! use zip::ZipArchive;
+//! use zip::ZipArchive; // requires 'zip' crate
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let file = open("https://example.com/archive.zip", OpenMode::Read)?;
@@ -51,7 +51,7 @@
 //!
 //! ## Tuning parallelism and cache
 //!
-//! ```rust
+//! ```rust,no_run
 //! use pravaha::{HttpFileSystem, FileSystem, OpenMode};
 //! use std::time::Duration;
 //!
