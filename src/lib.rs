@@ -16,10 +16,10 @@
 //! ## Basic usage
 //!
 //! ```rust
-//! use pravaha::{open, File};
+//! use pravaha::{open, File, OpenMode};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut file = open("https://example.com/data.bin", "r")?;
+//! let mut file = open("https://example.com/data.bin", OpenMode::Read)?;
 //!
 //! let mut buf = vec![0u8; 4096];
 //! let n = file.read(&mut buf)?;
@@ -39,11 +39,11 @@
 //! `std::io::Read + Seek`:
 //!
 //! ```rust
-//! use pravaha::{open, FileAdapter};
+//! use pravaha::{open, FileAdapter, OpenMode};
 //! use zip::ZipArchive;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let file = open("https://example.com/archive.zip", "r")?;
+//! let file = open("https://example.com/archive.zip", OpenMode::Read)?;
 //! let mut archive = ZipArchive::new(FileAdapter::new(file))?;
 //! # Ok(())
 //! # }
@@ -52,7 +52,7 @@
 //! ## Tuning parallelism and cache
 //!
 //! ```rust
-//! use pravaha::{HttpFileSystem, FileSystem};
+//! use pravaha::{HttpFileSystem, FileSystem, OpenMode};
 //! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,7 +67,7 @@
 //!     .read_timeout(Duration::from_secs(30))
 //!     .build();
 //!
-//! let mut file = fs.open("https://example.com/large.bin", "r")?;
+//! let mut file = fs.open("https://example.com/large.bin", OpenMode::Read)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -162,32 +162,35 @@ impl Read for FileAdapter {
     }
 }
 
+pub(crate) fn resolve_seek(pos: SeekFrom, current: u64, size: Option<u64>) -> io::Result<u64> {
+    match pos {
+        SeekFrom::Start(o) => Ok(o),
+        SeekFrom::Current(o) => {
+            if o >= 0 {
+                Ok(current.saturating_add(o as u64))
+            } else {
+                Ok(current.saturating_sub((-o) as u64))
+            }
+        }
+        SeekFrom::End(o) => {
+            let size = size.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Cannot seek from end without known file size",
+                )
+            })?;
+            if o >= 0 {
+                Ok(size.saturating_add(o as u64))
+            } else {
+                Ok(size.saturating_sub((-o) as u64))
+            }
+        }
+    }
+}
+
 impl Seek for FileAdapter {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(o) => o,
-            SeekFrom::Current(o) => {
-                let cur = self.inner.tell();
-                if o >= 0 {
-                    cur.saturating_add(o as u64)
-                } else {
-                    cur.saturating_sub((-o) as u64)
-                }
-            }
-            SeekFrom::End(o) => {
-                let size = self.inner.size().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Cannot seek from end without known file size",
-                    )
-                })?;
-                if o >= 0 {
-                    size.saturating_add(o as u64)
-                } else {
-                    size.saturating_sub((-o) as u64)
-                }
-            }
-        };
+        let new_pos = resolve_seek(pos, self.inner.tell(), self.inner.size())?;
         self.inner.seek(new_pos).map_err(io::Error::other)?;
         Ok(new_pos)
     }

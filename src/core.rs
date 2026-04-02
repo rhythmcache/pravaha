@@ -57,8 +57,13 @@ pub trait File: Send {
     fn close(&mut self) {}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    Read,
+}
+
 pub trait FileSystem: Send + Sync {
-    fn open(&self, path: &str, mode: &str) -> Result<Box<dyn File>>;
+    fn open(&self, path: &str, mode: OpenMode) -> Result<Box<dyn File>>;
 }
 
 /// Create a filesystem for the given URL.
@@ -71,7 +76,7 @@ pub fn create(url: &str) -> Result<Box<dyn FileSystem>> {
 }
 
 /// Open a file directly.
-pub fn open(url: &str, mode: &str) -> Result<Box<dyn File>> {
+pub fn open(url: &str, mode: OpenMode) -> Result<Box<dyn File>> {
     let fs = create(url)?;
     fs.open(url, mode)
 }

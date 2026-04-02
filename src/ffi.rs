@@ -178,10 +178,18 @@ pub unsafe extern "C" fn pravaha_open(
     };
 
     let path_owned = path_str.to_owned();
+
     let mode_owned = mode_str.to_owned();
 
+    let open_mode = if mode_owned == "r" || mode_owned == "rb" {
+        crate::OpenMode::Read
+    } else {
+        set_last_error_str("Only read mode ('r' or 'rb') is supported");
+        return ptr::null_mut();
+    };
+
     ffi_catch(ptr::null_mut(), move || {
-        match unsafe { &*fs }.inner.open(&path_owned, &mode_owned) {
+        match unsafe { &*fs }.inner.open(&path_owned, open_mode) {
             Ok(file) => Box::into_raw(Box::new(PravahaFile { inner: file })),
             Err(e) => {
                 set_last_error(&e);
@@ -227,8 +235,15 @@ pub unsafe extern "C" fn pravaha_open_url(
     let url_owned = url_str.to_owned();
     let mode_owned = mode_str.to_owned();
 
+    let open_mode = if mode_owned == "r" || mode_owned == "rb" {
+        crate::OpenMode::Read
+    } else {
+        set_last_error_str("Only read mode ('r' or 'rb') is supported");
+        return ptr::null_mut();
+    };
+
     ffi_catch(ptr::null_mut(), move || {
-        match crate::open(&url_owned, &mode_owned) {
+        match crate::open(&url_owned, open_mode) {
             Ok(file) => Box::into_raw(Box::new(PravahaFile { inner: file })),
             Err(e) => {
                 set_last_error(&e);

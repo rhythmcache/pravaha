@@ -33,6 +33,7 @@ tokio = { version = "1.50", features = [
   "sync",
   "macros",
 ] }
+tokio-util = { version = "0.7.18", features = ["full"] }
 dashmap = "6.1.0"
 async-trait = "0.1.89"
 futures = "0.3.32"

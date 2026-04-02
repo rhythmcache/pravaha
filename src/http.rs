@@ -9,10 +9,12 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
-use crate::core::{File, FileSystem, FsError, Result};
+use crate::core::{File, FileSystem, FsError, OpenMode, Result};
 use crate::plug::AsyncHttp;
 use crate::plug::build_default_transport;
+use crate::resolve_seek;
 
 #[derive(Clone, Debug)]
 pub struct HttpConfig {
@@ -24,6 +26,7 @@ pub struct HttpConfig {
     pub cache_max_entries: usize,
     pub cache_max_bytes: usize,
     pub retry_max_attempts: usize,
+    pub ratelimit_max_retries: usize,
     pub retry_base_delay: Duration,
     pub retry_max_delay: Duration,
     pub connect_timeout: Duration,
@@ -41,6 +44,7 @@ impl Default for HttpConfig {
             cache_max_entries: 64,
             cache_max_bytes: 32 * 1024 * 1024,
             retry_max_attempts: 3,
+            ratelimit_max_retries: 5,
             retry_base_delay: Duration::from_millis(50),
             retry_max_delay: Duration::from_secs(2),
             connect_timeout: Duration::from_secs(10),
@@ -238,26 +242,35 @@ impl FetchEngine {
     }
 
     /// Kick off prefetch futures for the next `n` chunks without awaiting them.
-    fn prefetch_ahead(&self, url: Arc<str>, from_offset: u64, n: usize) {
+    fn prefetch_ahead(&self, url: Arc<str>, from_offset: u64, n: usize, token: CancellationToken) {
         for i in 0..n as u64 {
             let start = from_offset + i * self.config.chunk_size;
             // get_chunk registers the shared future in in_flight; we don't await.
             let fut = self.get_chunk(Arc::clone(&url), start);
+            let token = token.clone();
             // Drive the future on the Tokio runtime without blocking the caller.
             tokio::spawn(async move {
-                let _ = fut.await;
+                tokio::select! {
+                    _ = fut => {}
+                    _ = token.cancelled() => {}
+                }
             });
         }
     }
 
     async fn content_length(&self, url: &str) -> Result<Option<u64>> {
         let mut attempt = 0;
+        let mut ratelimit_attempt = 0;
         loop {
             match self.transport.get_content_length(url).await {
                 Ok(v) => return Ok(v),
                 Err(FsError::RateLimited { retry_after_secs }) => {
+                    if ratelimit_attempt >= self.config.ratelimit_max_retries {
+                        return Err(FsError::RateLimited { retry_after_secs });
+                    }
                     let wait = retry_after_secs.unwrap_or(5);
                     tokio::time::sleep(Duration::from_secs(wait)).await;
+                    ratelimit_attempt += 1;
                 }
                 Err(FsError::Network(e)) if attempt < self.config.retry_max_attempts => {
                     let d = retry_delay(
@@ -283,13 +296,17 @@ async fn fetch_with_retry(
     config: &HttpConfig,
 ) -> Result<Vec<u8>> {
     let mut attempt = 0;
+    let mut ratelimit_attempt = 0;
     loop {
         match transport.get_range(url, start, end).await {
             Ok(resp) => return Ok(resp.data),
             Err(FsError::RateLimited { retry_after_secs }) => {
+                if ratelimit_attempt >= config.ratelimit_max_retries {
+                    return Err(FsError::RateLimited { retry_after_secs });
+                }
                 let wait = retry_after_secs.unwrap_or(5);
                 tokio::time::sleep(Duration::from_secs(wait)).await;
-                // Rate-limit waits don't count as retry attempts.
+                ratelimit_attempt += 1;
             }
             Err(FsError::Network(e)) if attempt < config.retry_max_attempts => {
                 let d = retry_delay(config.retry_base_delay, config.retry_max_delay, attempt);
@@ -302,17 +319,18 @@ async fn fetch_with_retry(
     }
 }
 
-fn block_sync<F, T>(rt: &tokio::runtime::Handle, fut: F) -> T
+fn block_sync<F, T>(rt: &tokio::runtime::Handle, fut: F) -> Result<T>
 where
     F: std::future::Future<Output = T>,
 {
     match tokio::runtime::Handle::try_current() {
-        // We are already inside a Tokio worker thread.
-        // block_in_place suspends the current task and runs the future
-        // synchronously on the same thread without blocking the scheduler.
-        Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
-        // No runtime on this thread – plain block_on is fine.
-        Err(_) => rt.block_on(fut),
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                return Err(FsError::Network("Cannot perform blocking file I/O from a current_thread Tokio runtime. Use a multi_thread runtime.".into()));
+            }
+            Ok(tokio::task::block_in_place(|| rt.block_on(fut)))
+        }
+        Err(_) => Ok(rt.block_on(fut)),
     }
 }
 
@@ -327,6 +345,7 @@ pub struct HttpFile {
     cached_size: Cell<Option<Option<u64>>>,
     /// Whether the last read was sequential (used for prefetch decisions).
     last_read_end: Option<u64>,
+    cancel_token: CancellationToken,
 }
 
 impl HttpFile {
@@ -338,8 +357,9 @@ impl HttpFile {
             file_offset: 0,
             eof_reached: false,
             closed: false,
-            cached_size: Cell::new(None), // ← was: None
+            cached_size: Cell::new(None),
             last_read_end: None,
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -351,17 +371,26 @@ impl HttpFile {
     /// Blocking read of a single chunk via the shared async engine.
     fn fetch_chunk(&self, start: u64) -> Result<Arc<[u8]>> {
         let fut = self.engine.get_chunk(Arc::clone(&self.url), start);
-        block_sync(&self.rt, fut)
+        block_sync(&self.rt, fut)?
     }
 
     fn fetch_size(&self) -> Option<u64> {
-        if self.cached_size.get().is_none() {
-            let size = block_sync(&self.rt, self.engine.content_length(self.url.as_ref()))
-                .ok()
-                .flatten();
-            self.cached_size.set(Some(size));
+        if let Some(val) = self.cached_size.get() {
+            return val;
         }
-        self.cached_size.get().unwrap()
+        match block_sync(&self.rt, self.engine.content_length(self.url.as_ref())) {
+            Ok(Ok(val)) => {
+                self.cached_size.set(Some(val));
+                val
+            }
+            Ok(Err(_)) => None, // server gave no Content-Length, that's fine
+            Err(e) => {
+                // runtime misconfiguration surface during dev, silent in release
+                #[cfg(debug_assertions)]
+                eprintln!("[pravaha] block_sync failed in fetch_size(): {e}");
+                None
+            }
+        }
     }
 }
 
@@ -432,6 +461,7 @@ impl File for HttpFile {
                     Arc::clone(&self.url),
                     next_chunk,
                     self.engine.config.read_ahead_chunks,
+                    self.cancel_token.clone(),
                 );
             }
         }
@@ -465,7 +495,10 @@ impl File for HttpFile {
     }
 
     fn close(&mut self) {
-        self.closed = true;
+        if !self.closed {
+            self.closed = true;
+            self.cancel_token.cancel();
+        }
     }
 }
 
@@ -477,29 +510,7 @@ impl Read for HttpFile {
 
 impl Seek for HttpFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(o) => o,
-            SeekFrom::Current(o) => {
-                if o >= 0 {
-                    self.file_offset.saturating_add(o as u64)
-                } else {
-                    self.file_offset.saturating_sub((-o) as u64)
-                }
-            }
-            SeekFrom::End(o) => {
-                let size = self.size().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Cannot seek from end without known file size",
-                    )
-                })?;
-                if o >= 0 {
-                    size.saturating_add(o as u64)
-                } else {
-                    size.saturating_sub((-o) as u64)
-                }
-            }
-        };
+        let new_pos = resolve_seek(pos, self.file_offset, self.size())?;
         File::seek(self, new_pos).map_err(io::Error::other)?;
         Ok(new_pos)
     }
@@ -533,17 +544,14 @@ impl Default for HttpFileSystem {
 }
 
 impl FileSystem for HttpFileSystem {
-    fn open(&self, url: &str, mode: &str) -> Result<Box<dyn File>> {
-        if mode != "r" && mode != "rb" {
-            return Err(FsError::Io(
-                "Only read mode ('r' or 'rb') is supported".into(),
-            ));
+    fn open(&self, url: &str, mode: OpenMode) -> Result<Box<dyn File>> {
+        match mode {
+            OpenMode::Read => Ok(Box::new(HttpFile::new(
+                Arc::from(url),
+                Arc::clone(&self.engine),
+                self.rt.handle().clone(),
+            ))),
         }
-        Ok(Box::new(HttpFile::new(
-            Arc::from(url),
-            Arc::clone(&self.engine),
-            self.rt.handle().clone(),
-        )))
     }
 }
 
@@ -598,6 +606,11 @@ impl HttpFileSystemBuilder {
 
     pub fn retry_max_attempts(mut self, v: usize) -> Self {
         self.config.retry_max_attempts = v;
+        self
+    }
+
+    pub fn ratelimit_max_retries(mut self, v: usize) -> Self {
+        self.config.ratelimit_max_retries = v;
         self
     }
 
