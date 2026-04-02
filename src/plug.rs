@@ -97,11 +97,12 @@ pub(crate) fn validate_range_response(
         return Err(FsError::Network(format!("HTTP error: {status}")));
     }
     if let Some((resp_start, _)) = content_range
-        && resp_start != requested_start {
-            return Err(FsError::Protocol(
-                "Server returned incorrect range start".into(),
-            ));
-        }
+        && resp_start != requested_start
+    {
+        return Err(FsError::Protocol(
+            "Server returned incorrect range start".into(),
+        ));
+    }
     Ok(())
 }
 

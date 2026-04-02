@@ -172,14 +172,14 @@ impl FetchEngine {
 
         // Fast path already in completed cache.
         if let Ok(mut lru) = self.lru.lock()
-            && let Some(data) = lru.get(&key) {
-                return futures::future::ready(Ok(data)).boxed().shared();
-            }
+            && let Some(data) = lru.get(&key)
+        {
+            return futures::future::ready(Ok(data)).boxed().shared();
+        }
 
         // In-flight deduplication.
         use dashmap::mapref::entry::Entry;
 
-        
         match self.in_flight.entry(key.clone()) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(v) => {
@@ -415,10 +415,11 @@ impl File for HttpFile {
 
             // Check EOF against file size if known.
             if let Some(Some(size)) = self.cached_size.get()
-                && self.file_offset >= size {
-                    self.eof_reached = true;
-                    break;
-                }
+                && self.file_offset >= size
+            {
+                self.eof_reached = true;
+                break;
+            }
         }
 
         if total_read > 0 {
