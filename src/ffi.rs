@@ -60,12 +60,11 @@ fn clear_last_error() {
 // Every extern "C" body is wrapped in this so that a Rust panic never
 // unwinds across the FFI boundary (which is undefined behaviour).
 // On panic the error is recorded and the supplied fallback value is returned.
-
 fn ffi_catch<F, T>(fallback: T, f: F) -> T
 where
-    F: FnOnce() -> T + panic::UnwindSafe,
+    F: FnOnce() -> T,
 {
-    match panic::catch_unwind(f) {
+    match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => {
             set_last_error_str("internal panic — please report this bug");
