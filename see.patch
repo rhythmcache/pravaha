@@ -1,0 +1,2426 @@
+diff --git a/src/core.rs b/src/core.rs
+index 08633b2..6e416eb 100644
+--- a/src/core.rs
++++ b/src/core.rs
+@@ -1,10 +1,9 @@
+ use std::io;
+-
+ use thiserror::Error;
+ 
+ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+ 
+-#[derive(Error, Debug)]
++#[derive(Error, Debug, Clone)]
+ pub enum FsError {
+     #[error("Network error: {0}")]
+     Network(String),
+@@ -13,18 +12,27 @@ pub enum FsError {
+     Protocol(String),
+ 
+     #[error("IO error: {0}")]
+-    Io(#[from] io::Error),
++    Io(String),
+ 
+     #[error("File is closed")]
+     FileClosed,
+ 
+     #[error("Unsupported protocol: {0}")]
+     UnsupportedProtocol(String),
++
++    #[error("Rate limited: retry after {retry_after_secs:?}s")]
++    RateLimited { retry_after_secs: Option<u64> },
++}
++
++impl From<io::Error> for FsError {
++    fn from(e: io::Error) -> Self {
++        FsError::Io(e.to_string())
++    }
+ }
+ 
+ pub type Result<T> = std::result::Result<T, FsError>;
+ 
+-/// Abstract file interface
++/// Abstract file interface — intentionally sync for public API stability.
+ pub trait File: Send {
+     /// Read up to buf.len() bytes into buf.
+     /// Returns number of bytes read (0 = EOF).
+@@ -40,7 +48,7 @@ pub trait File: Send {
+     fn eof(&self) -> bool;
+ 
+     /// Get file size if available.
+-    /// Returns None for streams, pipes, or chunked responses.
++    /// Returns None for streams or when server omits Content-Length.
+     fn size(&self) -> Option<u64> {
+         None
+     }
+diff --git a/src/ffi.rs b/src/ffi.rs
+index 22713d4..2d7528e 100644
+--- a/src/ffi.rs
++++ b/src/ffi.rs
+@@ -1,6 +1,7 @@
+-use libc::size_t;
++use libc::{size_t, ssize_t};
+ use std::ffi::{CStr, CString};
+ use std::os::raw::{c_char, c_int, c_void};
++use std::panic;
+ use std::ptr;
+ use std::slice;
+ 
+@@ -16,6 +17,8 @@ pub enum PravahaErrorCode {
+     PRAVAHA_FILE_CLOSED = 4,
+     PRAVAHA_UNSUPPORTED_PROTOCOL = 5,
+     PRAVAHA_INVALID_ARGUMENT = 6,
++    PRAVAHA_RATE_LIMITED = 7,
++    PRAVAHA_PANIC = 8,
+     PRAVAHA_UNKNOWN = 99,
+ }
+ 
+@@ -27,41 +30,63 @@ impl From<&FsError> for PravahaErrorCode {
+             FsError::Io(_) => PravahaErrorCode::PRAVAHA_IO,
+             FsError::FileClosed => PravahaErrorCode::PRAVAHA_FILE_CLOSED,
+             FsError::UnsupportedProtocol(_) => PravahaErrorCode::PRAVAHA_UNSUPPORTED_PROTOCOL,
++            FsError::RateLimited { .. } => PravahaErrorCode::PRAVAHA_RATE_LIMITED,
+         }
+     }
+ }
+ 
+ thread_local! {
+-    static LAST_ERROR: std::cell::RefCell<Option<CString>>  = const { std::cell::RefCell::new(None) };
++    static LAST_ERROR: std::cell::RefCell<Option<CString>> =
++        const { std::cell::RefCell::new(None) };
+ }
+ 
+ fn set_last_error(err: &FsError) {
+-    let error_msg = CString::new(err.to_string())
++    let msg = CString::new(err.to_string())
+         .unwrap_or_else(|_| CString::new("Failed to format error message").unwrap());
+-    LAST_ERROR.with(|e| {
+-        *e.borrow_mut() = Some(error_msg);
+-    });
++    LAST_ERROR.with(|e| *e.borrow_mut() = Some(msg));
++}
++
++fn set_last_error_str(msg: &str) {
++    let cs = CString::new(msg)
++        .unwrap_or_else(|_| CString::new("Failed to format error message").unwrap());
++    LAST_ERROR.with(|e| *e.borrow_mut() = Some(cs));
+ }
+ 
+ fn clear_last_error() {
+-    LAST_ERROR.with(|e| {
+-        *e.borrow_mut() = None;
+-    });
++    LAST_ERROR.with(|e| *e.borrow_mut() = None);
+ }
+ 
+-/// Opaque filesystem handle
++//
++// Every extern "C" body is wrapped in this so that a Rust panic never
++// unwinds across the FFI boundary (which is undefined behaviour).
++// On panic the error is recorded and the supplied fallback value is returned.
++
++fn ffi_catch<F, T>(fallback: T, f: F) -> T
++where
++    F: FnOnce() -> T + panic::UnwindSafe,
++{
++    match panic::catch_unwind(f) {
++        Ok(v) => v,
++        Err(_) => {
++            set_last_error_str("internal panic — please report this bug");
++            fallback
++        }
++    }
++}
++
++/// Opaque filesystem handle.
+ pub struct PravahaFilesystem {
+     inner: Box<dyn FileSystem>,
+ }
+ 
+-/// Opaque file handle
++/// Opaque file handle.
+ pub struct PravahaFile {
+     inner: Box<dyn File>,
+ }
+ 
+-/// Get the last error message for this thread
+-/// Returns NULL if no error
+-/// The returned string is valid until the next pravaha call on this thread
++/// Get the last error message for this thread.
++/// Returns NULL if no error has occurred.
++/// The pointer is valid until the next pravaha call on this thread.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn pravaha_last_error() -> *const c_char {
+     LAST_ERROR.with(|e| {
+@@ -72,54 +97,59 @@ pub extern "C" fn pravaha_last_error() -> *const c_char {
+     })
+ }
+ 
+-/// Create a filesystem for the given URL
+-/// Returns NULL on error
++/// Create a filesystem handle for the given base URL.
++/// Returns NULL on error; call `pravaha_last_error()` for details.
+ ///
+ /// # Safety
+-/// >> url must be a valid null-terminated C string
+-/// >> Caller must free the returned pointer with pravaha_filesystem_free()
++/// - `url` must be a valid null-terminated UTF-8 C string.
++/// - Caller must free with `pravaha_filesystem_free()`.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn pravaha_create(url: *const c_char) -> *mut PravahaFilesystem {
+     clear_last_error();
+ 
+     if url.is_null() {
+-        set_last_error(&FsError::Io(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "URL is null",
+-        )));
++        set_last_error_str("URL is null");
+         return ptr::null_mut();
+     }
+ 
+-    let url_str = unsafe {
+-        match CStr::from_ptr(url).to_str() {
+-            Ok(s) => s,
+-            Err(_) => {
+-                set_last_error(&FsError::Io(std::io::Error::new(
+-                    std::io::ErrorKind::InvalidInput,
+-                    "Invalid UTF-8 in URL",
+-                )));
+-                return ptr::null_mut();
+-            }
++    let url_str = match unsafe { CStr::from_ptr(url) }.to_str() {
++        Ok(s) => s,
++        Err(_) => {
++            set_last_error_str("Invalid UTF-8 in URL");
++            return ptr::null_mut();
+         }
+     };
+ 
+-    match crate::create(url_str) {
++    // Capture url_str as owned string so the closure is UnwindSafe.
++    let url_owned = url_str.to_owned();
++    ffi_catch(ptr::null_mut(), move || match crate::create(&url_owned) {
+         Ok(fs) => Box::into_raw(Box::new(PravahaFilesystem { inner: fs })),
+         Err(e) => {
+             set_last_error(&e);
+             ptr::null_mut()
+         }
++    })
++}
++
++/// Free a filesystem handle.
++///
++/// # Safety
++/// - `fs` must be a valid handle or NULL.
++/// - Must not be used after this call.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn pravaha_filesystem_free(fs: *mut PravahaFilesystem) {
++    if !fs.is_null() {
++        ffi_catch((), move || drop(unsafe { Box::from_raw(fs) }));
+     }
+ }
+ 
+-/// Open a file
+-/// Returns NULL on error
++/// Open a file via an existing filesystem handle.
++/// Returns NULL on error; call `pravaha_last_error()` for details.
+ ///
+ /// # Safety
+-///  fs must be a valid filesystem handle
+-/// >> path must be a valid null-terminated C string
+-/// >> mode must be a valid null-terminated C string
+-/// >> Caller must free the returned pointer with pravaha_file_close()
++/// - `fs` must be a valid filesystem handle.
++/// - `path` and `mode` must be valid null-terminated UTF-8 C strings.
++/// - Caller must free with `pravaha_file_close()`.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn pravaha_open(
+     fs: *mut PravahaFilesystem,
+@@ -129,273 +159,234 @@ pub unsafe extern "C" fn pravaha_open(
+     clear_last_error();
+ 
+     if fs.is_null() || path.is_null() || mode.is_null() {
+-        set_last_error(&FsError::Io(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "Null pointer argument",
+-        )));
++        set_last_error_str("Null pointer argument");
+         return ptr::null_mut();
+     }
+ 
+-    let fs_ref = unsafe { &*fs };
+-
+-    let path_str = unsafe {
+-        match CStr::from_ptr(path).to_str() {
+-            Ok(s) => s,
+-            Err(_) => {
+-                set_last_error(&FsError::Io(std::io::Error::new(
+-                    std::io::ErrorKind::InvalidInput,
+-                    "Invalid UTF-8 in path",
+-                )));
+-                return ptr::null_mut();
+-            }
++    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
++        Ok(s) => s,
++        Err(_) => {
++            set_last_error_str("Invalid UTF-8 in path");
++            return ptr::null_mut();
++        }
++    };
++    let mode_str = match unsafe { CStr::from_ptr(mode) }.to_str() {
++        Ok(s) => s,
++        Err(_) => {
++            set_last_error_str("Invalid UTF-8 in mode");
++            return ptr::null_mut();
+         }
+     };
+ 
+-    let mode_str = unsafe {
+-        match CStr::from_ptr(mode).to_str() {
+-            Ok(s) => s,
+-            Err(_) => {
+-                set_last_error(&FsError::Io(std::io::Error::new(
+-                    std::io::ErrorKind::InvalidInput,
+-                    "Invalid UTF-8 in mode",
+-                )));
+-                return ptr::null_mut();
++    let path_owned = path_str.to_owned();
++    let mode_owned = mode_str.to_owned();
++
++    ffi_catch(ptr::null_mut(), move || {
++        match unsafe { &*fs }.inner.open(&path_owned, &mode_owned) {
++            Ok(file) => Box::into_raw(Box::new(PravahaFile { inner: file })),
++            Err(e) => {
++                set_last_error(&e);
++                ptr::null_mut()
+             }
+         }
++    })
++}
++
++/// Open a file directly from a URL without a separate filesystem handle.
++/// Returns NULL on error; call `pravaha_last_error()` for details.
++///
++/// # Safety
++/// - `url` and `mode` must be valid null-terminated UTF-8 C strings.
++/// - Caller must free with `pravaha_file_close()`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn pravaha_open_url(
++    url: *const c_char,
++    mode: *const c_char,
++) -> *mut PravahaFile {
++    clear_last_error();
++
++    if url.is_null() || mode.is_null() {
++        set_last_error_str("Null pointer argument");
++        return ptr::null_mut();
++    }
++
++    let url_str = match unsafe { CStr::from_ptr(url) }.to_str() {
++        Ok(s) => s,
++        Err(_) => {
++            set_last_error_str("Invalid UTF-8 in URL");
++            return ptr::null_mut();
++        }
++    };
++    let mode_str = match unsafe { CStr::from_ptr(mode) }.to_str() {
++        Ok(s) => s,
++        Err(_) => {
++            set_last_error_str("Invalid UTF-8 in mode");
++            return ptr::null_mut();
++        }
+     };
+ 
+-    match fs_ref.inner.open(path_str, mode_str) {
+-        Ok(file) => Box::into_raw(Box::new(PravahaFile { inner: file })),
+-        Err(e) => {
+-            set_last_error(&e);
+-            ptr::null_mut()
++    let url_owned = url_str.to_owned();
++    let mode_owned = mode_str.to_owned();
++
++    ffi_catch(ptr::null_mut(), move || {
++        match crate::open(&url_owned, &mode_owned) {
++            Ok(file) => Box::into_raw(Box::new(PravahaFile { inner: file })),
++            Err(e) => {
++                set_last_error(&e);
++                ptr::null_mut()
++            }
+         }
++    })
++}
++
++/// Close a file and free its resources.
++///
++/// # Safety
++/// - `file` must be a valid handle or NULL.
++/// - Must not be used after this call.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn pravaha_file_close(file: *mut PravahaFile) {
++    if !file.is_null() {
++        ffi_catch((), move || drop(unsafe { Box::from_raw(file) }));
+     }
+ }
+ 
+-/// Read up to size bytes from file into buffer
+-/// Returns number of bytes read, or -1 on error
++/// Read up to `size` bytes into `buffer`.
++/// Returns bytes read (0 = EOF), or -1 on error.
+ ///
+ /// # Safety
+-/// >> file must be a valid file handle
+-/// >> buffer must be valid for writes of at least size bytes
++/// - `file` must be a valid file handle.
++/// - `buffer` must be valid for writes of at least `size` bytes.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn pravaha_read(
+     file: *mut PravahaFile,
+     buffer: *mut c_void,
+     size: size_t,
+-) -> isize {
++) -> ssize_t {
+     clear_last_error();
+ 
+     if file.is_null() || buffer.is_null() {
+-        set_last_error(&FsError::Io(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "Null pointer argument",
+-        )));
++        set_last_error_str("Null pointer argument");
+         return -1;
+     }
+ 
+-    let file_ref = unsafe { &mut *file };
++    // caller guarantees buffer is valid for `size` bytes.
+     let buf = unsafe { slice::from_raw_parts_mut(buffer as *mut u8, size) };
+ 
+-    match file_ref.inner.read(buf) {
+-        Ok(n) => n as isize,
++    ffi_catch(-1, move || match unsafe { &mut *file }.inner.read(buf) {
++        Ok(n) => n as ssize_t,
+         Err(e) => {
+             set_last_error(&e);
+             -1
+         }
+-    }
++    })
+ }
+ 
+-/// Seek to absolute position in file
+-/// Returns 0 on success, error code on failure
++/// Seek to an absolute byte position.
++/// Returns `PRAVAHA_SUCCESS` (0) on success, or an error code on failure.
+ ///
+ /// # Safety
+-/// >> file must be a valid file handle
++/// - `file` must be a valid file handle.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn pravaha_seek(file: *mut PravahaFile, pos: u64) -> c_int {
+     clear_last_error();
+ 
+     if file.is_null() {
+-        set_last_error(&FsError::Io(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "Null file pointer",
+-        )));
++        set_last_error_str("Null file pointer");
+         return PravahaErrorCode::PRAVAHA_INVALID_ARGUMENT as c_int;
+     }
+ 
+-    let file_ref = unsafe { &mut *file };
+-
+-    match file_ref.inner.seek(pos) {
+-        Ok(_) => PravahaErrorCode::PRAVAHA_SUCCESS as c_int,
+-        Err(e) => {
+-            let code = PravahaErrorCode::from(&e);
+-            set_last_error(&e);
+-            code as c_int
+-        }
+-    }
++    ffi_catch(
++        PravahaErrorCode::PRAVAHA_PANIC as c_int,
++        move || match unsafe { &mut *file }.inner.seek(pos) {
++            Ok(_) => PravahaErrorCode::PRAVAHA_SUCCESS as c_int,
++            Err(e) => {
++                let c = PravahaErrorCode::from(&e) as c_int;
++                set_last_error(&e);
++                c
++            }
++        },
++    )
+ }
+ 
+-/// Get current position in file
+-/// Returns current position, or 0 if file is invalid
++/// Get the current byte position in the file.
++/// Writes position into `*out_pos`. Returns `PRAVAHA_SUCCESS` or an error code.
+ ///
+ /// # Safety
+-/// >> file must be a valid file handle
++/// - `file` must be a valid file handle.
++/// - `out_pos` must be valid for writes.
+ #[unsafe(no_mangle)]
+-pub unsafe extern "C" fn pravaha_tell(file: *const PravahaFile) -> u64 {
++pub unsafe extern "C" fn pravaha_tell(file: *const PravahaFile, out_pos: *mut u64) -> c_int {
+     clear_last_error();
+ 
+-    if file.is_null() {
+-        set_last_error(&FsError::Io(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "Null file pointer",
+-        )));
+-        return 0;
++    if file.is_null() || out_pos.is_null() {
++        set_last_error_str("Null pointer argument");
++        return PravahaErrorCode::PRAVAHA_INVALID_ARGUMENT as c_int;
+     }
+ 
+-    let file_ref = unsafe { &*file };
+-    file_ref.inner.tell()
++    ffi_catch(PravahaErrorCode::PRAVAHA_PANIC as c_int, move || {
++        unsafe { *out_pos = (*file).inner.tell() };
++        PravahaErrorCode::PRAVAHA_SUCCESS as c_int
++    })
+ }
+ 
+-/// Get file size if available
+-/// Returns size, or 0 if not available
+-/// Sets has_size to 1 if size is available, 0 otherwise
++/// Get the file size if available.
++/// Sets `*has_size` to 1 and writes size into `*out_size` when known,
++/// or sets `*has_size` to 0 when Content-Length was not provided.
++/// Returns `PRAVAHA_SUCCESS` or an error code.
+ ///
+ /// # Safety
+-/// >> file must be a valid file handle
+-/// >> has_size must be valid for writes
++/// - `file` must be a valid file handle.
++/// - `out_size` and `has_size` must be valid for writes.
+ #[unsafe(no_mangle)]
+-pub unsafe extern "C" fn pravaha_size(file: *const PravahaFile, has_size: *mut c_int) -> u64 {
++pub unsafe extern "C" fn pravaha_size(
++    file: *const PravahaFile,
++    out_size: *mut u64,
++    has_size: *mut c_int,
++) -> c_int {
+     clear_last_error();
+ 
+-    if file.is_null() || has_size.is_null() {
+-        if !has_size.is_null() {
+-            unsafe { *has_size = 0 };
+-        }
+-        set_last_error(&FsError::Io(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "Null pointer argument",
+-        )));
+-        return 0;
++    if file.is_null() || out_size.is_null() || has_size.is_null() {
++        set_last_error_str("Null pointer argument");
++        return PravahaErrorCode::PRAVAHA_INVALID_ARGUMENT as c_int;
+     }
+ 
+-    let file_ref = unsafe { &*file };
+-
+-    match file_ref.inner.size() {
+-        Some(size) => {
+-            unsafe { *has_size = 1 };
+-            size
+-        }
+-        None => {
+-            unsafe { *has_size = 0 };
+-            0
++    ffi_catch(PravahaErrorCode::PRAVAHA_PANIC as c_int, move || {
++        match unsafe { &*file }.inner.size() {
++            Some(sz) => unsafe {
++                *out_size = sz;
++                *has_size = 1
++            },
++            None => unsafe {
++                *out_size = 0;
++                *has_size = 0
++            },
+         }
+-    }
++        PravahaErrorCode::PRAVAHA_SUCCESS as c_int
++    })
+ }
+ 
+-/// Check if at end of file
+-/// Returns 1 if EOF, 0 otherwise
++/// Check if the file position is at EOF.
++/// Returns 1 if EOF, 0 otherwise.
++/// Sets the last error if `file` is NULL.
+ ///
+ /// # Safety
+-/// >> file must be a valid file handle
++/// - `file` must be a valid file handle or NULL.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn pravaha_eof(file: *const PravahaFile) -> c_int {
+     clear_last_error();
+ 
+     if file.is_null() {
++        set_last_error_str("Null file pointer");
+         return 0;
+     }
+ 
+-    let file_ref = unsafe { &*file };
+-    if file_ref.inner.eof() { 1 } else { 0 }
+-}
+-
+-/// Close a file and free its resources
+-///
+-/// # Safety
+-/// >> file must be a valid file handle or NULL
+-/// >> file must not be used after this call
+-#[unsafe(no_mangle)]
+-pub unsafe extern "C" fn pravaha_file_close(file: *mut PravahaFile) {
+-    if !file.is_null() {
+-        let mut file_box = unsafe { Box::from_raw(file) };
+-        file_box.inner.close();
+-    }
+-}
+-
+-/// Free a filesystem handle
+-///
+-/// # Safety
+-/// >> fs must be a valid filesystem handle or NULL
+-/// >> fs must not be used after this call
+-#[unsafe(no_mangle)]
+-pub unsafe extern "C" fn pravaha_filesystem_free(fs: *mut PravahaFilesystem) {
+-    if !fs.is_null() {
+-        let _ = unsafe { Box::from_raw(fs) };
+-    }
++    ffi_catch(0, move || if unsafe { &*file }.inner.eof() { 1 } else { 0 })
+ }
+ 
+-/// Get library version string
+-/// Returns pointer to static version string
++/// Returns a pointer to a static null-terminated version string.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn pravaha_version() -> *const c_char {
+     static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+     VERSION.as_ptr() as *const c_char
+ }
+-
+-/// Open a file directly without creating a filesystem handle
+-/// Returns NULL on error
+-///
+-/// # Safety
+-/// >> url must be a valid null-terminated C string
+-/// >> mode must be a valid null-terminated C string
+-/// >> Caller must free the returned pointer with pravaha_file_close()
+-#[unsafe(no_mangle)]
+-pub unsafe extern "C" fn pravaha_open_url(
+-    url: *const c_char,
+-    mode: *const c_char,
+-) -> *mut PravahaFile {
+-    clear_last_error();
+-
+-    if url.is_null() || mode.is_null() {
+-        set_last_error(&FsError::Io(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "Null pointer argument",
+-        )));
+-        return ptr::null_mut();
+-    }
+-
+-    let url_str = unsafe {
+-        match CStr::from_ptr(url).to_str() {
+-            Ok(s) => s,
+-            Err(_) => {
+-                set_last_error(&FsError::Io(std::io::Error::new(
+-                    std::io::ErrorKind::InvalidInput,
+-                    "Invalid UTF-8 in URL",
+-                )));
+-                return ptr::null_mut();
+-            }
+-        }
+-    };
+-
+-    let mode_str = unsafe {
+-        match CStr::from_ptr(mode).to_str() {
+-            Ok(s) => s,
+-            Err(_) => {
+-                set_last_error(&FsError::Io(std::io::Error::new(
+-                    std::io::ErrorKind::InvalidInput,
+-                    "Invalid UTF-8 in mode",
+-                )));
+-                return ptr::null_mut();
+-            }
+-        }
+-    };
+-
+-    match crate::open(url_str, mode_str) {
+-        Ok(file) => Box::into_raw(Box::new(PravahaFile { inner: file })),
+-        Err(e) => {
+-            set_last_error(&e);
+-            ptr::null_mut()
+-        }
+-    }
+-}
+diff --git a/src/http.rs b/src/http.rs
+index a37845c..c708579 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -1,25 +1,26 @@
+-use ahash::AHashMap as HashMap;
+ use std::cell::Cell;
+ use std::collections::VecDeque;
+ use std::io::{self, Read, Seek, SeekFrom};
+-use std::sync::OnceLock;
+-use std::sync::{Arc, Mutex, mpsc};
+-use std::thread;
++use std::sync::Arc;
+ use std::time::Duration;
+ 
+-use crate::core::{File, FileSystem, FsError, Result};
+-use crate::plug::{BlockingHttp, HttpResponse, build_default_transport};
++use dashmap::DashMap;
++use futures::FutureExt;
++use futures::future::{BoxFuture, Shared};
++use tokio::runtime::Handle;
++use tokio::sync::Semaphore;
+ 
+-fn empty_bytes() -> Arc<[u8]> {
+-    static EMPTY: OnceLock<Arc<[u8]>> = OnceLock::new();
+-    EMPTY.get_or_init(|| Arc::from(&[][..])).clone()
+-}
++use crate::core::{File, FileSystem, FsError, Result};
++use crate::plug::AsyncHttp;
++use crate::plug::build_default_transport;
+ 
+ #[derive(Clone, Debug)]
+ pub struct HttpConfig {
+     pub chunk_size: u64,
+-    pub read_ahead: bool,
+-    pub read_ahead_trigger: u64,
++    /// How many chunks ahead to speculatively prefetch during sequential reads.
++    pub read_ahead_chunks: usize,
++    /// Max parallel in-flight fetches across all operations on this file.
++    pub max_parallel_fetches: usize,
+     pub cache_max_entries: usize,
+     pub cache_max_bytes: usize,
+     pub retry_max_attempts: usize,
+@@ -35,8 +36,8 @@ impl Default for HttpConfig {
+         let chunk_size = 256 * 1024;
+         Self {
+             chunk_size,
+-            read_ahead: true,
+-            read_ahead_trigger: (chunk_size / 2).max(1),
++            read_ahead_chunks: 3,
++            max_parallel_fetches: 4,
+             cache_max_entries: 64,
+             cache_max_bytes: 32 * 1024 * 1024,
+             retry_max_attempts: 3,
+@@ -50,37 +51,37 @@ impl Default for HttpConfig {
+ }
+ 
+ fn retry_delay(base: Duration, max: Duration, attempt: usize) -> Duration {
+-    let shift = attempt.min(20);
+-    let mult = 1u32.checked_shl(shift as u32).unwrap_or(u32::MAX);
+-    let delay = base.checked_mul(mult).unwrap_or(max);
+-    if delay > max { max } else { delay }
++    let mult = 1u32.checked_shl(attempt.min(20) as u32).unwrap_or(u32::MAX);
++    let d = base.checked_mul(mult).unwrap_or(max);
++    if d > max { max } else { d }
+ }
+ 
++/// A chunk is identified by its aligned start offset.  End is always
++/// `start + chunk_size - 1` (clamped by the server).
+ #[derive(Clone, Hash, Eq, PartialEq, Debug)]
+-struct CacheKey {
++struct ChunkKey {
+     url: Arc<str>,
+     start: u64,
+-    end: u64,
+ }
+ 
+-#[derive(Clone)]
+-struct CacheEntry {
+-    data: Arc<[u8]>,
+-    size: usize,
+-}
++//  The DashMap stores InFlight entries.  Once the future resolves the data goes
++//  into the LRU cache and the InFlight entry is removed.  Any number of waiters
++//  can clone + await the same SharedFuture without duplicating the HTTP request.
++
++type ChunkFuture = Shared<BoxFuture<'static, Result<Arc<[u8]>>>>;
+ 
+-struct RangeCache {
+-    map: HashMap<CacheKey, CacheEntry>,
+-    lru: VecDeque<CacheKey>,
++struct LruCache {
++    map: ahash::AHashMap<ChunkKey, Arc<[u8]>>,
++    lru: VecDeque<ChunkKey>,
+     max_entries: usize,
+     max_bytes: usize,
+     current_bytes: usize,
+ }
+ 
+-impl RangeCache {
++impl LruCache {
+     fn new(max_entries: usize, max_bytes: usize) -> Self {
+         Self {
+-            map: HashMap::new(),
++            map: ahash::AHashMap::new(),
+             lru: VecDeque::new(),
+             max_entries,
+             max_bytes,
+@@ -88,55 +89,43 @@ impl RangeCache {
+         }
+     }
+ 
+-    fn get(&mut self, key: &CacheKey) -> Option<Arc<[u8]>> {
++    fn get(&mut self, key: &ChunkKey) -> Option<Arc<[u8]>> {
+         if self.max_entries == 0 || self.max_bytes == 0 {
+             return None;
+         }
+-
+-        let entry = self.map.get(key)?.clone();
+-        self.touch_lru(key);
+-        Some(entry.data)
++        let data = self.map.get(key)?.clone();
++        // Move to front.
++        if let Some(pos) = self.lru.iter().position(|k| k == key) {
++            self.lru.remove(pos);
++        }
++        self.lru.push_front(key.clone());
++        Some(data)
+     }
+ 
+-    fn insert(&mut self, key: CacheKey, data: Arc<[u8]>) {
++    fn insert(&mut self, key: ChunkKey, data: Arc<[u8]>) {
+         if self.max_entries == 0 || self.max_bytes == 0 {
+             return;
+         }
+-
+         let size = data.len();
+         if size > self.max_bytes {
+             return;
+         }
+ 
+-        if let Some(existing) = self.map.remove(&key) {
+-            self.current_bytes = self.current_bytes.saturating_sub(existing.size);
+-            self.remove_lru(&key);
++        if let Some(old) = self.map.remove(&key) {
++            self.current_bytes = self.current_bytes.saturating_sub(old.len());
++            if let Some(pos) = self.lru.iter().position(|k| k == &key) {
++                self.lru.remove(pos);
++            }
+         }
+ 
+-        let entry = CacheEntry { data, size };
+-
+         self.current_bytes = self.current_bytes.saturating_add(size);
+-        self.map.insert(key.clone(), entry);
++        self.map.insert(key.clone(), data);
+         self.lru.push_front(key);
+-        self.evict_to_limits();
+-    }
+ 
+-    fn touch_lru(&mut self, key: &CacheKey) {
+-        self.remove_lru(key);
+-        self.lru.push_front(key.clone());
+-    }
+-
+-    fn remove_lru(&mut self, key: &CacheKey) {
+-        if let Some(pos) = self.lru.iter().position(|k| k == key) {
+-            self.lru.remove(pos);
+-        }
+-    }
+-
+-    fn evict_to_limits(&mut self) {
+         while self.map.len() > self.max_entries || self.current_bytes > self.max_bytes {
+-            if let Some(key) = self.lru.pop_back() {
+-                if let Some(entry) = self.map.remove(&key) {
+-                    self.current_bytes = self.current_bytes.saturating_sub(entry.size);
++            if let Some(evict) = self.lru.pop_back() {
++                if let Some(d) = self.map.remove(&evict) {
++                    self.current_bytes = self.current_bytes.saturating_sub(d.len());
+                 }
+             } else {
+                 break;
+@@ -145,321 +134,235 @@ impl RangeCache {
+     }
+ }
+ 
+-struct RangeBuffer {
+-    data: Arc<[u8]>,
+-    buffer_start: u64,
+-    buffer_end: u64,
++pub(crate) struct FetchEngine {
++    transport: Arc<dyn AsyncHttp>,
++    config: HttpConfig,
++    /// In-flight futures, multiple readers share the same future.
++    in_flight: Arc<DashMap<ChunkKey, ChunkFuture>>,
++    /// Completed chunks.
++    lru: Arc<std::sync::Mutex<LruCache>>,
++    /// Bounds the number of simultaneous outgoing HTTP requests.
++    semaphore: Arc<Semaphore>,
+ }
+ 
+-impl RangeBuffer {
+-    fn new() -> Self {
++impl FetchEngine {
++    fn new(transport: Arc<dyn AsyncHttp>, config: HttpConfig) -> Self {
++        let sem = Arc::new(Semaphore::new(config.max_parallel_fetches));
++        let lru = Arc::new(std::sync::Mutex::new(LruCache::new(
++            config.cache_max_entries,
++            config.cache_max_bytes,
++        )));
+         Self {
+-            data: empty_bytes(),
+-            buffer_start: 0,
+-            buffer_end: 0,
++            transport,
++            config,
++            in_flight: Arc::new(DashMap::new()),
++            lru,
++            semaphore: sem,
+         }
+     }
+ 
+-    fn set_data(&mut self, data: Arc<[u8]>, file_start: u64, file_end: u64) {
+-        self.data = data;
+-        self.buffer_start = file_start;
+-        self.buffer_end = file_end;
+-    }
+-
+-    fn contains(&self, file_offset: u64) -> bool {
+-        file_offset >= self.buffer_start && file_offset < self.buffer_end
+-    }
++    /// Returns a future that resolves to the chunk data.
++    /// Deduplicates: if a fetch for this chunk is already running, returns
++    /// the same shared future instead of starting a new request.
++    fn get_chunk(&self, url: Arc<str>, start: u64) -> ChunkFuture {
++        let key = ChunkKey {
++            url: Arc::clone(&url),
++            start,
++        };
+ 
+-    fn read(&self, out: &mut [u8], file_offset: u64) -> usize {
+-        if !self.contains(file_offset) {
+-            return 0;
++        // Fast path already in completed cache.
++        if let Ok(mut lru) = self.lru.lock() {
++            if let Some(data) = lru.get(&key) {
++                return futures::future::ready(Ok(data)).boxed().shared();
++            }
+         }
+ 
+-        let buffer_offset = (file_offset - self.buffer_start) as usize;
+-        let available = self.data.len() - buffer_offset;
+-        let to_copy = available.min(out.len());
++        // In-flight deduplication.
++        use dashmap::mapref::entry::Entry;
++
++        let shared = match self.in_flight.entry(key.clone()) {
++            Entry::Occupied(e) => return e.get().clone(),
++            Entry::Vacant(v) => {
++                // Build the future only if we won the race.
++                let transport = Arc::clone(&self.transport);
++                let in_flight = Arc::clone(&self.in_flight);
++                let lru = Arc::clone(&self.lru);
++                let sem = Arc::clone(&self.semaphore);
++                let config = self.config.clone();
++                let key2 = key.clone();
++                let chunk_size = self.config.chunk_size;
++                let url2 = Arc::clone(&url);
++
++                let fut: BoxFuture<'static, Result<Arc<[u8]>>> = Box::pin(async move {
++                    // Acquire concurrency permit before touching the network.
++                    let _permit = sem
++                        .acquire()
++                        .await
++                        .map_err(|_| FsError::Network("Semaphore closed".into()))?;
++
++                    let range_end = start.saturating_add(chunk_size.saturating_sub(1));
++                    let data =
++                        fetch_with_retry(&transport, &url2, start, range_end, &config).await?;
++
++                    if data.is_empty() && start > 0 {
++                        // A 416 would have been caught by validate_range_response already.
++                        // An empty body for a non-zero start is a protocol violation.
++                        return Err(FsError::Protocol(format!(
++                            "Server returned empty body for range {start}-{range_end}"
++                        )));
++                    }
++
++                    #[cfg(debug_assertions)]
++                    if !data.is_empty() && (data.len() as u64) < chunk_size && start > 0 {
++                        eprintln!(
++                            "[pravaha] short chunk at {start}: got {} bytes, expected {chunk_size}",
++                            data.len()
++                        );
++                    }
++
++                    let arc: Arc<[u8]> = data.into();
++
++                    // Promote to completed cache and remove from in-flight.
++                    if let Ok(mut lru) = lru.lock() {
++                        lru.insert(key2.clone(), Arc::clone(&arc));
++                    }
++                    in_flight.remove(&key2);
++                    Ok(arc)
++                });
+ 
+-        out[..to_copy].copy_from_slice(&self.data[buffer_offset..buffer_offset + to_copy]);
+-        to_copy
++                let shared = fut.shared();
++                v.insert(shared.clone());
++                shared
++            }
++        };
++        shared
+     }
+ 
+-    fn clear(&mut self) {
+-        self.data = empty_bytes();
+-        self.buffer_start = 0;
+-        self.buffer_end = 0;
++    /// Kick off prefetch futures for the next `n` chunks without awaiting them.
++    fn prefetch_ahead(&self, url: Arc<str>, from_offset: u64, n: usize) {
++        for i in 0..n as u64 {
++            let start = from_offset + i * self.config.chunk_size;
++            // get_chunk registers the shared future in in_flight; we don't await.
++            let fut = self.get_chunk(Arc::clone(&url), start);
++            // Drive the future on the Tokio runtime without blocking the caller.
++            tokio::spawn(async move {
++                let _ = fut.await;
++            });
++        }
+     }
+ 
+-    fn end(&self) -> u64 {
+-        self.buffer_end
++    async fn content_length(&self, url: &str) -> Result<Option<u64>> {
++        let mut attempt = 0;
++        loop {
++            match self.transport.get_content_length(url).await {
++                Ok(v) => return Ok(v),
++                Err(FsError::RateLimited { retry_after_secs }) => {
++                    let wait = retry_after_secs.unwrap_or(5);
++                    tokio::time::sleep(Duration::from_secs(wait)).await;
++                }
++                Err(FsError::Network(e)) if attempt < self.config.retry_max_attempts => {
++                    let d = retry_delay(
++                        self.config.retry_base_delay,
++                        self.config.retry_max_delay,
++                        attempt,
++                    );
++                    tokio::time::sleep(d).await;
++                    attempt += 1;
++                    let _ = e;
++                }
++                Err(e) => return Err(e),
++            }
++        }
++    }
++}
++
++async fn fetch_with_retry(
++    transport: &Arc<dyn AsyncHttp>,
++    url: &str,
++    start: u64,
++    end: u64,
++    config: &HttpConfig,
++) -> Result<Vec<u8>> {
++    let mut attempt = 0;
++    loop {
++        match transport.get_range(url, start, end).await {
++            Ok(resp) => return Ok(resp.data),
++            Err(FsError::RateLimited { retry_after_secs }) => {
++                let wait = retry_after_secs.unwrap_or(5);
++                tokio::time::sleep(Duration::from_secs(wait)).await;
++                // Rate-limit waits don't count as retry attempts.
++            }
++            Err(FsError::Network(e)) if attempt < config.retry_max_attempts => {
++                let d = retry_delay(config.retry_base_delay, config.retry_max_delay, attempt);
++                tokio::time::sleep(d).await;
++                attempt += 1;
++                let _ = e;
++            }
++            Err(e) => return Err(e),
++        }
+     }
+ }
+ 
+-struct PrefetchState {
+-    range_start: u64,
+-    range_end: u64,
+-    rx: mpsc::Receiver<Result<HttpResponse>>,
++fn block_sync<F, T>(rt: &tokio::runtime::Handle, fut: F) -> T
++where
++    F: std::future::Future<Output = T>,
++{
++    match tokio::runtime::Handle::try_current() {
++        // We are already inside a Tokio worker thread.
++        // block_in_place suspends the current task and runs the future
++        // synchronously on the same thread without blocking the scheduler.
++        Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
++        // No runtime on this thread – plain block_on is fine.
++        Err(_) => rt.block_on(fut),
++    }
+ }
+ 
+ pub struct HttpFile {
+     url: Arc<str>,
+-    transport: Arc<dyn BlockingHttp>,
+-    config: HttpConfig,
+-    cache: Arc<Mutex<RangeCache>>,
+-    buffer: RangeBuffer,
++    engine: Arc<FetchEngine>,
++    rt: Handle,
+     file_offset: u64,
+     eof_reached: bool,
+     closed: bool,
++    /// Cached result of HEAD request.
+     cached_size: Cell<Option<Option<u64>>>,
+-    prefetch: Option<PrefetchState>,
++    /// Whether the last read was sequential (used for prefetch decisions).
+     last_read_end: Option<u64>,
+ }
+ 
+ impl HttpFile {
+-    const MAX_REFILL_ATTEMPTS: usize = 3;
+-
+-    fn new(
+-        url: Arc<str>,
+-        transport: Arc<dyn BlockingHttp>,
+-        config: HttpConfig,
+-        cache: Arc<Mutex<RangeCache>>,
+-    ) -> Self {
++    fn new(url: Arc<str>, engine: Arc<FetchEngine>, rt: Handle) -> Self {
+         Self {
+             url,
+-            transport,
+-            config,
+-            cache,
+-            buffer: RangeBuffer::new(),
++            engine,
++            rt,
+             file_offset: 0,
+             eof_reached: false,
+             closed: false,
+-            cached_size: Cell::new(None),
+-            prefetch: None,
++            cached_size: Cell::new(None), // ← was: None
+             last_read_end: None,
+         }
+     }
+ 
+-    fn get_content_length_with_retry(&self) -> Result<Option<u64>> {
+-        let mut attempt = 0;
+-        loop {
+-            match self.transport.get_content_length(&self.url) {
+-                Ok(v) => return Ok(v),
+-                Err(FsError::Network(err)) => {
+-                    if attempt >= self.config.retry_max_attempts {
+-                        return Err(FsError::Network(err));
+-                    }
+-                }
+-                Err(e) => return Err(e),
+-            }
+-
+-            let delay = retry_delay(
+-                self.config.retry_base_delay,
+-                self.config.retry_max_delay,
+-                attempt,
+-            );
+-            thread::sleep(delay);
+-            attempt += 1;
+-        }
+-    }
+-
+-    fn get_range_with_retry(&self, start: u64, end: u64) -> Result<HttpResponse> {
+-        let mut attempt = 0;
+-        loop {
+-            match self.transport.get_range(&self.url, start, end) {
+-                Ok(v) => return Ok(v),
+-                Err(FsError::Network(err)) => {
+-                    if attempt >= self.config.retry_max_attempts {
+-                        return Err(FsError::Network(err));
+-                    }
+-                }
+-                Err(e) => return Err(e),
+-            }
+-
+-            let delay = retry_delay(
+-                self.config.retry_base_delay,
+-                self.config.retry_max_delay,
+-                attempt,
+-            );
+-            thread::sleep(delay);
+-            attempt += 1;
+-        }
+-    }
+-
+-    fn try_cache_lookup(&self, range_start: u64, range_end: u64) -> Option<Arc<[u8]>> {
+-        let key = CacheKey {
+-            url: Arc::clone(&self.url),
+-            start: range_start,
+-            end: range_end,
+-        };
+-
+-        let mut cache = self.cache.lock().ok()?;
+-        cache.get(&key)
+-    }
+-
+-    fn store_cache(&self, range_start: u64, range_end: u64, data: Arc<[u8]>) {
+-        let key = CacheKey {
+-            url: Arc::clone(&self.url),
+-            start: range_start,
+-            end: range_end,
+-        };
+-
+-        if let Ok(mut cache) = self.cache.lock() {
+-            cache.insert(key, data);
+-        }
++    fn chunk_start(&self, offset: u64) -> u64 {
++        let cs = self.engine.config.chunk_size;
++        (offset / cs) * cs
+     }
+ 
+-    fn take_prefetch_if_match(
+-        &mut self,
+-        range_start: u64,
+-        range_end: u64,
+-    ) -> Option<Result<HttpResponse>> {
+-        let prefetch = self.prefetch.take()?;
+-        if prefetch.range_start == range_start && prefetch.range_end == range_end {
+-            return Some(
+-                prefetch
+-                    .rx
+-                    .recv()
+-                    .unwrap_or_else(|_| Err(FsError::Network("Prefetch thread canceled".into()))),
+-            );
+-        }
+-
+-        self.prefetch = Some(prefetch);
+-        None
++    /// Blocking read of a single chunk via the shared async engine.
++    fn fetch_chunk(&self, start: u64) -> Result<Arc<[u8]>> {
++        let fut = self.engine.get_chunk(Arc::clone(&self.url), start);
++        block_sync(&self.rt, fut)
+     }
+ 
+-    fn maybe_prefetch_next(&mut self) {
+-        if !self.config.read_ahead || self.eof_reached {
+-            return;
+-        }
+-
+-        let buffer_end = self.buffer.end();
+-        if buffer_end <= self.file_offset {
+-            return;
+-        }
+-
+-        let remaining = buffer_end - self.file_offset;
+-        if remaining > self.config.read_ahead_trigger {
+-            return;
+-        }
+-
+-        let next_start = buffer_end;
+-        let next_end = next_start.saturating_add(self.config.chunk_size.saturating_sub(1));
+-
+-        if let Some(prefetch) = &self.prefetch
+-            && prefetch.range_start == next_start
+-            && prefetch.range_end == next_end
+-        {
+-            return;
+-        }
+-
+-        if self.try_cache_lookup(next_start, next_end).is_some() {
+-            return;
+-        }
+-
+-        let transport = Arc::clone(&self.transport);
+-        let url = self.url.clone();
+-        let config = self.config.clone();
+-        let (tx, rx) = mpsc::channel();
+-
+-        thread::spawn(move || {
+-            let mut attempt = 0;
+-            let result = loop {
+-                match transport.get_range(&url, next_start, next_end) {
+-                    Ok(v) => break Ok(v),
+-                    Err(FsError::Network(err)) => {
+-                        if attempt >= config.retry_max_attempts {
+-                            break Err(FsError::Network(err));
+-                        }
+-                    }
+-                    Err(e) => break Err(e),
+-                }
+-
+-                let delay = retry_delay(config.retry_base_delay, config.retry_max_delay, attempt);
+-                thread::sleep(delay);
+-                attempt += 1;
+-            };
+-            let _ = tx.send(result);
+-        });
+-
+-        self.prefetch = Some(PrefetchState {
+-            range_start: next_start,
+-            range_end: next_end,
+-            rx,
+-        });
+-    }
+-
+-    fn refill_buffer(&mut self) -> Result<()> {
+-        let range_start = self.file_offset;
+-        let range_end = self
+-            .file_offset
+-            .saturating_add(self.config.chunk_size.saturating_sub(1));
+-
+-        let old_buffer_end = self.buffer.end();
+-        let expected_size = range_end - range_start + 1;
+-
+-        let file_size = if self.cached_size.get().is_none() {
+-            let sz = self.get_content_length_with_retry().ok().flatten();
+-            self.cached_size.set(Some(sz));
+-            sz
+-        } else {
+-            self.cached_size.get().unwrap()
+-        };
+-
+-        if let Some(data) = self.try_cache_lookup(range_start, range_end) {
+-            let actual_size = data.len() as u64;
+-            if actual_size == 0 {
+-                self.eof_reached = true;
+-                self.buffer.clear();
+-                return Ok(());
+-            }
+-            let actual_end = range_start + actual_size;
+-
+-            let reached_eof = if let Some(size) = file_size {
+-                actual_end >= size
+-            } else {
+-                actual_size < expected_size && old_buffer_end > 0
+-            };
+-
+-            if reached_eof {
+-                self.eof_reached = true;
+-            }
+-
+-            self.buffer.set_data(data, range_start, actual_end);
+-            return Ok(());
+-        }
+-
+-        let response = match self.take_prefetch_if_match(range_start, range_end) {
+-            Some(result) => result?,
+-            None => self.get_range_with_retry(range_start, range_end)?,
+-        };
+-
+-        if response.data.is_empty() {
+-            self.eof_reached = true;
+-            self.buffer.clear();
+-            return Ok(());
+-        }
+-
+-        let actual_size = response.data.len() as u64;
+-        let actual_end = range_start + actual_size;
+-
+-        let reached_eof = if let Some(size) = file_size {
+-            actual_end >= size
+-        } else {
+-            actual_size < expected_size && old_buffer_end > 0
+-        };
+-
+-        if reached_eof {
+-            self.eof_reached = true;
+-        }
+-
+-        let data: Arc<[u8]> = response.data.into();
+-        self.store_cache(range_start, range_end, Arc::clone(&data));
+-        self.buffer.set_data(data, range_start, actual_end);
+-
+-        if self.buffer.end() <= old_buffer_end && old_buffer_end > 0 {
+-            return Err(FsError::Protocol("Buffer refill did not advance".into()));
++    fn fetch_size(&self) -> Option<u64> {
++        if self.cached_size.get().is_none() {
++            let size = block_sync(&self.rt, self.engine.content_length(self.url.as_ref()))
++                .ok()
++                .flatten();
++            self.cached_size.set(Some(size));
+         }
+-
+-        Ok(())
++        self.cached_size.get().unwrap()
+     }
+ }
+ 
+@@ -468,66 +371,69 @@ impl File for HttpFile {
+         if buf.is_empty() {
+             return Ok(0);
+         }
+-
+         if self.closed {
+             return Err(FsError::FileClosed);
+         }
+ 
+         let start_offset = self.file_offset;
+         let mut total_read = 0;
+-        let mut refill_attempts = 0;
+ 
+         while total_read < buf.len() {
+-            if !self.buffer.contains(self.file_offset) {
+-                if self.eof_reached {
+-                    break;
+-                }
+-
+-                self.refill_buffer()?;
+-                refill_attempts += 1;
+-
+-                if self.eof_reached && !self.buffer.contains(self.file_offset) {
+-                    break;
+-                }
++            if self.eof_reached {
++                break;
++            }
+ 
+-                if refill_attempts > Self::MAX_REFILL_ATTEMPTS {
+-                    return Err(FsError::Protocol(
+-                        "Too many refill attempts without progress".into(),
+-                    ));
++            let chunk_start = self.chunk_start(self.file_offset);
++            let chunk = match self.fetch_chunk(chunk_start) {
++                Ok(c) => c,
++                Err(e) => {
++                    return if total_read > 0 {
++                        Ok(total_read)
++                    } else {
++                        Err(e)
++                    };
+                 }
++            };
+ 
+-                continue;
++            if chunk.is_empty() {
++                self.eof_reached = true;
++                break;
+             }
+ 
+-            refill_attempts = 0;
+-            let bytes_read = self.buffer.read(&mut buf[total_read..], self.file_offset);
+-
+-            if bytes_read == 0 {
+-                return Err(FsError::Protocol(
+-                    "Internal error: buffer contains offset but read returned 0".into(),
+-                ));
++            // Offset within this chunk.
++            let inner = (self.file_offset - chunk_start) as usize;
++            if inner >= chunk.len() {
++                self.eof_reached = true;
++                break;
+             }
+ 
+-            total_read += bytes_read;
+-            self.file_offset += bytes_read as u64;
++            let available = &chunk[inner..];
++            let to_copy = available.len().min(buf.len() - total_read);
++            buf[total_read..total_read + to_copy].copy_from_slice(&available[..to_copy]);
+ 
+-            if self.eof_reached && !self.buffer.contains(self.file_offset) {
+-                break;
++            total_read += to_copy;
++            self.file_offset += to_copy as u64;
++
++            // Check EOF against file size if known.
++            if let Some(Some(size)) = self.cached_size.get() {
++                if self.file_offset >= size {
++                    self.eof_reached = true;
++                    break;
++                }
+             }
+         }
+ 
+         if total_read > 0 {
+-            let sequential = match self.last_read_end {
+-                Some(prev_end) => start_offset == prev_end,
+-                None => true,
+-            };
+-
+-            self.last_read_end = Some(start_offset + total_read as u64);
++            let sequential = self.last_read_end.map_or(true, |end| start_offset == end);
++            self.last_read_end = Some(self.file_offset);
+ 
+             if sequential {
+-                self.maybe_prefetch_next();
+-            } else {
+-                self.prefetch = None;
++                let next_chunk = self.chunk_start(self.file_offset);
++                self.engine.prefetch_ahead(
++                    Arc::clone(&self.url),
++                    next_chunk,
++                    self.engine.config.read_ahead_chunks,
++                );
+             }
+         }
+ 
+@@ -538,16 +444,9 @@ impl File for HttpFile {
+         if self.closed {
+             return Err(FsError::FileClosed);
+         }
+-
+-        if pos < self.file_offset || !self.buffer.contains(pos) {
+-            self.buffer.clear();
+-        }
+-
+         self.file_offset = pos;
+         self.eof_reached = false;
+-        self.prefetch = None;
+         self.last_read_end = None;
+-
+         Ok(())
+     }
+ 
+@@ -563,21 +462,11 @@ impl File for HttpFile {
+         if self.closed {
+             return None;
+         }
+-
+-        if self.cached_size.get().is_none() {
+-            let size = self.get_content_length_with_retry().ok().flatten();
+-            self.cached_size.set(Some(size));
+-        }
+-
+-        self.cached_size.get().unwrap()
++        self.fetch_size()
+     }
+ 
+     fn close(&mut self) {
+-        if !self.closed {
+-            self.buffer.clear();
+-            self.prefetch = None;
+-            self.closed = true;
+-        }
++        self.closed = true;
+     }
+ }
+ 
+@@ -590,30 +479,28 @@ impl Read for HttpFile {
+ impl Seek for HttpFile {
+     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+         let new_pos = match pos {
+-            SeekFrom::Start(offset) => offset,
+-            SeekFrom::Current(offset) => {
+-                if offset >= 0 {
+-                    self.file_offset.saturating_add(offset as u64)
++            SeekFrom::Start(o) => o,
++            SeekFrom::Current(o) => {
++                if o >= 0 {
++                    self.file_offset.saturating_add(o as u64)
+                 } else {
+-                    self.file_offset.saturating_sub((-offset) as u64)
++                    self.file_offset.saturating_sub((-o) as u64)
+                 }
+             }
+-            SeekFrom::End(offset) => {
++            SeekFrom::End(o) => {
+                 let size = self.size().ok_or_else(|| {
+                     io::Error::new(
+                         io::ErrorKind::Unsupported,
+                         "Cannot seek from end without known file size",
+                     )
+                 })?;
+-
+-                if offset >= 0 {
+-                    size.saturating_add(offset as u64)
++                if o >= 0 {
++                    size.saturating_add(o as u64)
+                 } else {
+-                    size.saturating_sub((-offset) as u64)
++                    size.saturating_sub((-o) as u64)
+                 }
+             }
+         };
+-
+         File::seek(self, new_pos).map_err(io::Error::other)?;
+         Ok(new_pos)
+     }
+@@ -626,14 +513,44 @@ impl Drop for HttpFile {
+ }
+ 
+ pub struct HttpFileSystem {
+-    transport: Arc<dyn BlockingHttp>,
+-    config: HttpConfig,
+-    cache: Arc<Mutex<RangeCache>>,
++    engine: Arc<FetchEngine>,
++    rt: tokio::runtime::Runtime,
++}
++
++impl HttpFileSystem {
++    pub fn new() -> Self {
++        HttpFileSystemBuilder::new().build()
++    }
++
++    pub fn builder() -> HttpFileSystemBuilder {
++        HttpFileSystemBuilder::new()
++    }
++}
++
++impl Default for HttpFileSystem {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl FileSystem for HttpFileSystem {
++    fn open(&self, url: &str, mode: &str) -> Result<Box<dyn File>> {
++        if mode != "r" && mode != "rb" {
++            return Err(FsError::Io(
++                "Only read mode ('r' or 'rb') is supported".into(),
++            ));
++        }
++        Ok(Box::new(HttpFile::new(
++            Arc::from(url),
++            Arc::clone(&self.engine),
++            self.rt.handle().clone(),
++        )))
++    }
+ }
+ 
+ pub struct HttpFileSystemBuilder {
+     config: HttpConfig,
+-    transport: Option<Arc<dyn BlockingHttp>>,
++    transport: Option<Arc<dyn AsyncHttp>>,
+ }
+ 
+ impl Default for HttpFileSystemBuilder {
+@@ -650,63 +567,63 @@ impl HttpFileSystemBuilder {
+         }
+     }
+ 
+-    pub fn transport(mut self, transport: Arc<dyn BlockingHttp>) -> Self {
+-        self.transport = Some(transport);
++    pub fn transport(mut self, t: Arc<dyn AsyncHttp>) -> Self {
++        self.transport = Some(t);
+         self
+     }
+ 
+-    pub fn chunk_size(mut self, chunk_size: u64) -> Self {
+-        self.config.chunk_size = chunk_size.max(1);
++    pub fn chunk_size(mut self, v: u64) -> Self {
++        self.config.chunk_size = v.max(1);
+         self
+     }
+ 
+-    pub fn read_ahead(mut self, enabled: bool) -> Self {
+-        self.config.read_ahead = enabled;
++    pub fn read_ahead_chunks(mut self, n: usize) -> Self {
++        self.config.read_ahead_chunks = n;
+         self
+     }
+ 
+-    pub fn read_ahead_trigger(mut self, trigger: u64) -> Self {
+-        self.config.read_ahead_trigger = trigger.max(1);
++    pub fn max_parallel_fetches(mut self, n: usize) -> Self {
++        self.config.max_parallel_fetches = n.max(1);
+         self
+     }
+ 
+-    pub fn cache_max_entries(mut self, max_entries: usize) -> Self {
+-        self.config.cache_max_entries = max_entries;
++    pub fn cache_max_entries(mut self, v: usize) -> Self {
++        self.config.cache_max_entries = v;
+         self
+     }
+ 
+-    pub fn cache_max_bytes(mut self, max_bytes: usize) -> Self {
+-        self.config.cache_max_bytes = max_bytes;
++    pub fn cache_max_bytes(mut self, v: usize) -> Self {
++        self.config.cache_max_bytes = v;
+         self
+     }
+ 
+-    pub fn retry_max_attempts(mut self, attempts: usize) -> Self {
+-        self.config.retry_max_attempts = attempts;
++    pub fn retry_max_attempts(mut self, v: usize) -> Self {
++        self.config.retry_max_attempts = v;
+         self
+     }
+ 
+-    pub fn retry_base_delay(mut self, delay: Duration) -> Self {
+-        self.config.retry_base_delay = delay;
++    pub fn retry_base_delay(mut self, v: Duration) -> Self {
++        self.config.retry_base_delay = v;
+         self
+     }
+ 
+-    pub fn retry_max_delay(mut self, delay: Duration) -> Self {
+-        self.config.retry_max_delay = delay;
++    pub fn retry_max_delay(mut self, v: Duration) -> Self {
++        self.config.retry_max_delay = v;
+         self
+     }
+ 
+-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+-        self.config.connect_timeout = timeout;
++    pub fn connect_timeout(mut self, v: Duration) -> Self {
++        self.config.connect_timeout = v;
+         self
+     }
+ 
+-    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+-        self.config.read_timeout = timeout;
++    pub fn read_timeout(mut self, v: Duration) -> Self {
++        self.config.read_timeout = v;
+         self
+     }
+ 
+-    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+-        self.config.idle_timeout = timeout;
++    pub fn idle_timeout(mut self, v: Duration) -> Self {
++        self.config.idle_timeout = v;
+         self
+     }
+ 
+@@ -714,48 +631,12 @@ impl HttpFileSystemBuilder {
+         let transport = self
+             .transport
+             .unwrap_or_else(|| build_default_transport(&self.config));
+-
+-        HttpFileSystem {
+-            transport,
+-            config: self.config.clone(),
+-            cache: Arc::new(Mutex::new(RangeCache::new(
+-                self.config.cache_max_entries,
+-                self.config.cache_max_bytes,
+-            ))),
+-        }
+-    }
+-}
+-
+-impl HttpFileSystem {
+-    pub fn new() -> Self {
+-        HttpFileSystemBuilder::new().build()
+-    }
+-
+-    pub fn builder() -> HttpFileSystemBuilder {
+-        HttpFileSystemBuilder::new()
+-    }
+-}
+-
+-impl Default for HttpFileSystem {
+-    fn default() -> Self {
+-        Self::new()
+-    }
+-}
+-
+-impl FileSystem for HttpFileSystem {
+-    fn open(&self, url: &str, mode: &str) -> Result<Box<dyn File>> {
+-        if mode != "r" && mode != "rb" {
+-            return Err(FsError::Io(io::Error::new(
+-                io::ErrorKind::InvalidInput,
+-                "Only read mode ('r' or 'rb') is supported",
+-            )));
+-        }
+-
+-        Ok(Box::new(HttpFile::new(
+-            Arc::from(url),
+-            Arc::clone(&self.transport),
+-            self.config.clone(),
+-            Arc::clone(&self.cache),
+-        )))
++        let rt = tokio::runtime::Builder::new_multi_thread()
++            .enable_all()
++            .thread_name("pravaha-io")
++            .build()
++            .expect("Failed to build Tokio runtime");
++        let engine = Arc::new(FetchEngine::new(transport, self.config));
++        HttpFileSystem { engine, rt }
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 3391727..6cd0014 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,10 +1,17 @@
+ //! # Pravaha
+ //!
+-//! Pravaha (प्रवाह - "flow" in Sanskrit) lets you read files from HTTP(S) URLs like they're
+-//! regular files on disk. It handles all the messy details: chunking, caching, retries, and
+-//! prefetching.
+-//!
+-//! Right now it supports HTTP and HTTPS. More protocols might come later.
++//! Pravaha (pravaah -- "flow" in Sanskrit) lets you read files from HTTP(S) URLs
++//! like they are regular files on disk.  It handles chunking, caching, retries,
++//! parallel prefetching, and in-flight deduplication transparently.
++//!
++//! The **public API is fully synchronous** (`File` / `FileSystem` traits).
++//! Internally it runs an async engine (Tokio) and bridges back to sync via
++//! `Handle::block_on`.  This means:
++//! - No `async` leaks into your code.
++//! - Multiple concurrent `File` handles on the same `HttpFileSystem` share one
++//!   connection pool and one chunk cache -- duplicate fetches are impossible.
++//! - The engine can issue up to `max_parallel_fetches` HTTP requests at once
++//!   (default 4), so sequential reads automatically pipeline chunks.
+ //!
+ //! ## Basic usage
+ //!
+@@ -14,31 +21,22 @@
+ //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+ //! let mut file = open("https://example.com/data.bin", "r")?;
+ //!
+-//! let mut buffer = vec![0u8; 1024];
+-//! let bytes_read = file.read(&mut buffer)?;
++//! let mut buf = vec![0u8; 4096];
++//! let n = file.read(&mut buf)?;
+ //!
+-//! file.seek(1000)?;
++//! file.seek(1_000_000)?;
+ //!
+ //! if let Some(size) = file.size() {
+-//!     println!("File size: {} bytes", size);
++//!     println!("File size: {size} bytes");
+ //! }
+ //! # Ok(())
+ //! # }
+ //! ```
+ //!
+-//! ## What it does
+-//!
+-//! When you read from a remote file, it:
+-//! - Fetches data in configurable chunks (default 256KB)
+-//! - Caches chunks you've already read (in case you seek backwards)
+-//! - Prefetches the next chunk in the background for sequential reads
+-//! - Retries failed requests with exponential backoff
+-//! - Concrete file implementations (`HttpFile`) implement `std::io::Read` and `Seek` traits
+-//!
+ //! ## Using with standard I/O libraries
+ //!
+-//! The `open()` function returns `Box<dyn File>`, which uses the `File` trait from this crate.
+-//! To use with libraries that require `std::io::Read` and `Seek`, wrap it in `FileAdapter`:
++//! `open()` returns `Box<dyn File>`.  Wrap it in `FileAdapter` to get
++//! `std::io::Read + Seek`:
+ //!
+ //! ```rust
+ //! use pravaha::{open, FileAdapter};
+@@ -51,9 +49,7 @@
+ //! # }
+ //! ```
+ //!
+-//! ## Tuning the behavior
+-//!
+-//! If the defaults don't work for you:
++//! ## Tuning parallelism and cache
+ //!
+ //! ```rust
+ //! use pravaha::{HttpFileSystem, FileSystem};
+@@ -61,76 +57,69 @@
+ //!
+ //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+ //! let fs = HttpFileSystem::builder()
+-//!     .chunk_size(512 * 1024)           // fetch 512KB at a time
+-//!     .read_ahead(true)                  // prefetch next chunk automatically
+-//!     .cache_max_entries(128)            // remember up to 128 chunks
+-//!     .cache_max_bytes(64 * 1024 * 1024) // use max 64MB for cache
+-//!     .retry_max_attempts(5)             // try 5 times before giving up
++//!     .chunk_size(512 * 1024)             // 512 KB per chunk
++//!     .read_ahead_chunks(4)               // prefetch 4 chunks ahead
++//!     .max_parallel_fetches(8)            // up to 8 concurrent HTTP requests
++//!     .cache_max_entries(128)
++//!     .cache_max_bytes(128 * 1024 * 1024) // 128 MB cache
++//!     .retry_max_attempts(5)
+ //!     .connect_timeout(Duration::from_secs(10))
+ //!     .read_timeout(Duration::from_secs(30))
+ //!     .build();
+ //!
+-//! let mut file = fs.open("https://example.com/large-file.bin", "r")?;
++//! let mut file = fs.open("https://example.com/large.bin", "r")?;
+ //! # Ok(())
+ //! # }
+ //! ```
+ //!
+-//! ## Using it from C
+-//!
+-//! Build with `--features capi` to get C bindings:
+-//!
+-//! ```c
+-//! #include <pravaha.h>
+-//!
+-//! PravahaFile* file = pravaha_open_url("https://example.com/data.bin", "r");
+-//! if (!file) {
+-//!     fprintf(stderr, "Error: %s\n", pravaha_last_error());
+-//!     return 1;
+-//! }
+-//!
+-//! char buffer[1024];
+-//! ssize_t bytes_read = pravaha_read(file, buffer, sizeof(buffer));
+-//!
+-//! pravaha_file_close(file);
++//! ## Architecture notes
++//!
++//! ```text
++//! +-----------------------------------------------------+
++//! |  Public sync API  (File / FileSystem traits)        |
++//! |  HttpFile::read -> rt.block_on(engine.get_chunk())  |
++//! +--------------------+--------------------------------+
++//!                      |
++//! +--------------------v--------------------------------+
++//! |  FetchEngine  (per HttpFileSystem, shared via Arc)  |
++//! |                                                     |
++//! |  +---------------------------------------------+   |
++//! |  | ChunkCache  DashMap<ChunkKey, SharedFuture>  |   |
++//! |  |  * Missing  -> spawn new fetch future        |   |
++//! |  |  * InFlight -> clone + await existing future |   |
++//! |  |  * Ready    -> LRU hit, wrap in ready future |   |
++//! |  +---------------------------------------------+   |
++//! |                                                     |
++//! |  Semaphore: caps concurrent HTTP requests           |
++//! |  PrefetchPlanner: fires read_ahead_chunks futures   |
++//! +--------------------+--------------------------------+
++//!                      |
++//! +--------------------v--------------------------------+
++//! |  AsyncHttp transport (reqwest async / curl via     |
++//! |  spawn_blocking)                                    |
++//! |  * Retry with exponential backoff                  |
++//! |  * Retry-After / 429 / 503 aware                   |
++//! +-----------------------------------------------------+
+ //! ```
+ //!
+-//! ## Some things to know
+-//!
+-//! Bigger chunks (256KB to 1MB) work better if you're reading files sequentially on a fast
+-//! network. Smaller chunks are fine for random access or slower connections.
+-//!
+-//! The cache helps if you're seeking around in the same area of a file. If you're just reading
+-//! sequentially once, you might want to reduce cache size or disable it entirely.
+-//!
+-//! Read-ahead prefetching makes sequential reads faster but wastes bandwidth if you're jumping
+-//! around randomly. It automatically turns off when it detects non-sequential access.
+-//!
+-//! The library needs servers to support HTTP Range requests (most do). If a server returns 200
+-//! instead of 206 for a range request, you'll get an error.
+-//!
+-//! The `size()` method returns `None` for streams without a known content-length or when the
+-//! server doesn't provide this information. You can still read from such files, but you won't
+-//! know their size in advance and cannot seek from the end.
+-//!
+-//! ## Errors
++//! ## Thread safety
+ //!
+-//! You'll get different errors for different problems:
+-//! - Network errors: can't connect, timeout, connection dropped
+-//! - Protocol errors: server doesn't support ranges, returned wrong data
+-//! - IO errors: standard Rust IO problems
+-//! - File closed: you tried to use a file after closing it
+-//! - Unsupported protocol: right now this means you tried something other than http/https
++//! `HttpFileSystem` is `Send + Sync` and can be shared freely.
++//! Individual `HttpFile` handles are `Send` (can be moved to another thread)
++//! but are not `Sync` -- don't share one handle across threads simultaneously,
++//! which is the standard Rust I/O pattern anyway.
+ //!
+-//! ## Thread safety
++//! ## Memory budget
+ //!
+-//! The FileSystem can be shared between threads safely. Individual File handles can be sent to
+-//! other threads but shouldn't be used from multiple threads at once (which is the recommended Rust
+-//! IO pattern anyway ig :(
++//! With `max_parallel_fetches = N` and `chunk_size = C`, peak in-flight memory
++//! is roughly `N x C` in addition to the completed LRU cache.  With defaults
++//! (4 x 256 KB = 1 MB) this is negligible; tune conservatively for
++//! memory-constrained environments.
+ //!
+ //! ## Feature flags
+ //!
+-//! - `curl` (default): use libcurl for HTTP
+-//! - `reqwest`: use reqwest instead of curl (don't enable both)
++//! - `curl` (default): use libcurl via `spawn_blocking`
++//! - `reqwest`: use async reqwest (don't enable both)
+ //! - `capi`: build the C API
+ 
+ pub mod core;
+@@ -139,13 +128,15 @@ pub mod plug;
+ 
+ pub use core::*;
+ pub use http::*;
+-pub use plug::*;
++pub use plug::AsyncHttp;
+ 
+ #[cfg(feature = "capi")]
+ pub mod ffi;
+ 
+ use std::io::{self, Read, Seek, SeekFrom};
+ 
++/// Adapts `Box<dyn File>` into `std::io::Read + Seek` for use with
++/// third-party libraries (zip, image decoders, etc.).
+ pub struct FileAdapter {
+     inner: Box<dyn File>,
+ }
+@@ -154,7 +145,6 @@ impl FileAdapter {
+     pub fn new(file: Box<dyn File>) -> Self {
+         Self { inner: file }
+     }
+-
+     pub fn into_inner(self) -> Box<dyn File> {
+         self.inner
+     }
+@@ -175,31 +165,29 @@ impl Read for FileAdapter {
+ impl Seek for FileAdapter {
+     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+         let new_pos = match pos {
+-            SeekFrom::Start(offset) => offset,
+-            SeekFrom::Current(offset) => {
+-                let current = self.inner.tell();
+-                if offset >= 0 {
+-                    current.saturating_add(offset as u64)
++            SeekFrom::Start(o) => o,
++            SeekFrom::Current(o) => {
++                let cur = self.inner.tell();
++                if o >= 0 {
++                    cur.saturating_add(o as u64)
+                 } else {
+-                    current.saturating_sub((-offset) as u64)
++                    cur.saturating_sub((-o) as u64)
+                 }
+             }
+-            SeekFrom::End(offset) => {
++            SeekFrom::End(o) => {
+                 let size = self.inner.size().ok_or_else(|| {
+                     io::Error::new(
+                         io::ErrorKind::Unsupported,
+                         "Cannot seek from end without known file size",
+                     )
+                 })?;
+-
+-                if offset >= 0 {
+-                    size.saturating_add(offset as u64)
++                if o >= 0 {
++                    size.saturating_add(o as u64)
+                 } else {
+-                    size.saturating_sub((-offset) as u64)
++                    size.saturating_sub((-o) as u64)
+                 }
+             }
+         };
+-
+         self.inner.seek(new_pos).map_err(io::Error::other)?;
+         Ok(new_pos)
+     }
+diff --git a/src/plug.rs b/src/plug.rs
+index 40fcdeb..6ccb25c 100644
+--- a/src/plug.rs
++++ b/src/plug.rs
+@@ -1,16 +1,17 @@
+ #![allow(dead_code)]
++
+ use crate::core::{FsError, Result};
+ use crate::http::HttpConfig;
+-use ahash::{HashMap, HashMapExt};
+ use std::sync::Arc;
+-use std::time::Duration;
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct HttpResponse {
+     pub data: Vec<u8>,
+     pub status: u16,
+     pub content_length: Option<u64>,
+     pub content_range: Option<(u64, u64)>,
++    /// Parsed Retry-After value in seconds, if server sent one.
++    pub retry_after_secs: Option<u64>,
+ }
+ 
+ impl HttpResponse {
+@@ -19,136 +20,164 @@ impl HttpResponse {
+         status: u16,
+         content_length: Option<u64>,
+         content_range: Option<(u64, u64)>,
++        retry_after_secs: Option<u64>,
+     ) -> Self {
+         Self {
+             data,
+             status,
+             content_length,
+             content_range,
++            retry_after_secs,
+         }
+     }
+ }
+ 
+-/// internal blocking transport trait.
+-pub trait BlockingHttp: Send + Sync {
+-    fn get_content_length(&self, url: &str) -> Result<Option<u64>>;
+-    fn get_range(&self, url: &str, start: u64, end: u64) -> Result<HttpResponse>;
++/// Async transport trait — internal only.
++#[async_trait::async_trait]
++pub trait AsyncHttp: Send + Sync {
++    async fn get_content_length(&self, url: &str) -> Result<Option<u64>>;
++    async fn get_range(&self, url: &str, start: u64, end: u64) -> Result<HttpResponse>;
+ }
+ 
+-#[cfg(all(not(feature = "reqwest"), not(feature = "curl")))]
+-compile_error!("Enable either `curl` (default) or `reqwest` feature.");
+-
+-pub(crate) fn build_default_transport(config: &HttpConfig) -> Arc<dyn BlockingHttp> {
++pub(crate) fn build_default_transport(config: &HttpConfig) -> Arc<dyn AsyncHttp> {
+     #[cfg(feature = "reqwest")]
+     {
+-        Arc::new(ReqwestBlockingTransport::new(config))
++        Arc::new(ReqwestAsyncTransport::new(config))
+     }
+     #[cfg(all(not(feature = "reqwest"), feature = "curl"))]
+     {
+-        Arc::new(CurlBlockingTransport::new(config))
++        // curl stays blocking; we run it on a spawn_blocking thread inside the async wrapper.
++        Arc::new(CurlAsyncTransport::new(config))
+     }
+ }
+ 
+-fn parse_content_range(header: &str) -> Option<(u64, u64)> {
++pub(crate) fn parse_content_range(header: &str) -> Option<(u64, u64)> {
+     let parts: Vec<&str> = header.split_whitespace().collect();
+     if parts.len() < 2 || parts[0] != "bytes" {
+         return None;
+     }
+-
+     let range_part = parts[1].split('/').next()?;
+-    let mut range_iter = range_part.split('-');
++    let mut it = range_part.split('-');
++    let start = it.next()?.parse::<u64>().ok()?;
++    let end = it.next()?.parse::<u64>().ok()?;
++    Some((start, end))
++}
+ 
+-    let start = range_iter.next()?.parse::<u64>().ok()?;
+-    let end = range_iter.next()?.parse::<u64>().ok()?;
++/// Parse Retry-After either an integer seconds value or an HTTP-date.
++pub(crate) fn parse_retry_after(header: &str) -> Option<u64> {
++    // Try plain integer first.
++    if let Ok(secs) = header.trim().parse::<u64>() {
++        return Some(secs);
++    }
++    // HTTP-date parsing is complex; return a safe default so callers back off.
++    Some(5)
++}
+ 
+-    Some((start, end))
++pub(crate) fn validate_range_response(
++    status: u16,
++    content_range: Option<(u64, u64)>,
++    requested_start: u64,
++    retry_after_secs: Option<u64>,
++) -> Result<()> {
++    if status == 429 || status == 503 {
++        return Err(FsError::RateLimited { retry_after_secs });
++    }
++    if status == 416 {
++        // Range not satisfiable  treat as EOF, handled by caller.
++        return Ok(());
++    }
++    if status == 200 {
++        return Err(FsError::Protocol(
++            "Server does not support Range requests (returned 200 instead of 206). \
++             This library requires strict Range semantics."
++                .into(),
++        ));
++    }
++    if status != 206 {
++        return Err(FsError::Network(format!("HTTP error: {status}")));
++    }
++    if let Some((resp_start, _)) = content_range {
++        if resp_start != requested_start {
++            return Err(FsError::Protocol(
++                "Server returned incorrect range start".into(),
++            ));
++        }
++    }
++    Ok(())
+ }
+ 
+ #[cfg(feature = "reqwest")]
+-struct ReqwestBlockingTransport {
+-    client: reqwest::blocking::Client,
++pub(crate) struct ReqwestAsyncTransport {
++    client: reqwest::Client,
+ }
+ 
+ #[cfg(feature = "reqwest")]
+-impl ReqwestBlockingTransport {
+-    fn new(config: &HttpConfig) -> Self {
+-        let client = reqwest::blocking::Client::builder()
++impl ReqwestAsyncTransport {
++    pub fn new(config: &HttpConfig) -> Self {
++        let client = reqwest::Client::builder()
+             .timeout(config.read_timeout)
+             .connect_timeout(config.connect_timeout)
+             .pool_idle_timeout(config.idle_timeout)
+             .build()
+-            .expect("Failed to create HTTP client");
+-
++            .expect("Failed to build async reqwest client");
+         Self { client }
+     }
+ }
+ 
+ #[cfg(feature = "reqwest")]
+-impl BlockingHttp for ReqwestBlockingTransport {
+-    fn get_content_length(&self, url: &str) -> Result<Option<u64>> {
+-        let response = self
++#[async_trait::async_trait]
++impl AsyncHttp for ReqwestAsyncTransport {
++    async fn get_content_length(&self, url: &str) -> Result<Option<u64>> {
++        let resp = self
+             .client
+             .head(url)
+             .send()
++            .await
+             .map_err(|e| FsError::Network(e.to_string()))?;
+ 
+-        if !response.status().is_success() {
++        if !resp.status().is_success() {
+             return Ok(None);
+         }
+-
+-        Ok(response.content_length())
++        Ok(resp.content_length())
+     }
+ 
+-    fn get_range(&self, url: &str, start: u64, end: u64) -> Result<HttpResponse> {
+-        let range_header = format!("bytes={}-{}", start, end);
+-
+-        let response = self
++    async fn get_range(&self, url: &str, start: u64, end: u64) -> Result<HttpResponse> {
++        let resp = self
+             .client
+             .get(url)
+-            .header("Range", range_header)
++            .header("Range", format!("bytes={start}-{end}"))
+             .send()
++            .await
+             .map_err(|e| FsError::Network(e.to_string()))?;
+ 
+-        let status = response.status().as_u16();
+-        let content_length = response.content_length();
+-
+-        let content_range = response
++        let status = resp.status().as_u16();
++        let content_length = resp.content_length();
++        let retry_after_secs = resp
++            .headers()
++            .get("retry-after")
++            .and_then(|v| v.to_str().ok())
++            .and_then(parse_retry_after);
++        let content_range = resp
+             .headers()
+             .get("content-range")
+             .and_then(|v| v.to_str().ok())
+             .and_then(parse_content_range);
+ 
++        validate_range_response(status, content_range, start, retry_after_secs)?;
++
+         if status == 416 {
+             return Ok(HttpResponse {
+                 data: Vec::new(),
+                 status,
+                 content_length,
+                 content_range,
++                retry_after_secs,
+             });
+         }
+ 
+-        if status == 200 {
+-            return Err(FsError::Protocol(
+-                "Server does not support Range requests (returned 200 instead of 206). \
+-                 This library requires strict Range semantics."
+-                    .into(),
+-            ));
+-        }
+-
+-        if status != 206 {
+-            return Err(FsError::Network(format!("HTTP error: {}", status)));
+-        }
+-
+-        if let Some((resp_start, _)) = content_range
+-            && resp_start != start
+-        {
+-            return Err(FsError::Protocol(
+-                "Server returned incorrect range start".into(),
+-            ));
+-        }
+-
+-        let data = response
++        let data = resp
+             .bytes()
++            .await
+             .map_err(|e| FsError::Network(e.to_string()))?
+             .to_vec();
+ 
+@@ -157,36 +186,41 @@ impl BlockingHttp for ReqwestBlockingTransport {
+             status,
+             content_length,
+             content_range,
++            retry_after_secs,
+         })
+     }
+ }
+ 
+ #[cfg(all(not(feature = "reqwest"), feature = "curl"))]
+-struct CurlBlockingTransport {
+-    connect_timeout: Duration,
+-    read_timeout: Duration,
++pub(crate) struct CurlAsyncTransport {
++    connect_timeout: std::time::Duration,
++    read_timeout: std::time::Duration,
+ }
+ 
+ #[cfg(all(not(feature = "reqwest"), feature = "curl"))]
+-impl CurlBlockingTransport {
+-    fn new(config: &HttpConfig) -> Self {
++impl CurlAsyncTransport {
++    pub fn new(config: &HttpConfig) -> Self {
+         Self {
+             connect_timeout: config.connect_timeout,
+             read_timeout: config.read_timeout,
+         }
+     }
+ 
+-    fn request(
+-        &self,
+-        url: &str,
++    fn do_request(
++        url: String,
+         head_only: bool,
+         range: Option<(u64, u64)>,
++        connect_timeout: std::time::Duration,
++        read_timeout: std::time::Duration,
+     ) -> Result<HttpResponse> {
++        use ahash::{HashMap, HashMapExt};
++
+         let mut easy = curl::easy::Easy::new();
+-        easy.url(url).map_err(|e| FsError::Network(e.to_string()))?;
+-        easy.connect_timeout(self.connect_timeout)
++        easy.url(&url)
++            .map_err(|e| FsError::Network(e.to_string()))?;
++        easy.connect_timeout(connect_timeout)
+             .map_err(|e| FsError::Network(e.to_string()))?;
+-        easy.timeout(self.read_timeout)
++        easy.timeout(read_timeout)
+             .map_err(|e| FsError::Network(e.to_string()))?;
+         easy.follow_location(true)
+             .map_err(|e| FsError::Network(e.to_string()))?;
+@@ -197,9 +231,8 @@ impl CurlBlockingTransport {
+             easy.custom_request("HEAD")
+                 .map_err(|e| FsError::Network(e.to_string()))?;
+         }
+-
+-        if let Some((start, end)) = range {
+-            easy.range(&format!("{start}-{end}"))
++        if let Some((s, e)) = range {
++            easy.range(&format!("{s}-{e}"))
+                 .map_err(|e| FsError::Network(e.to_string()))?;
+         }
+ 
+@@ -214,7 +247,6 @@ impl CurlBlockingTransport {
+                     Ok(chunk.len())
+                 })
+                 .map_err(|e| FsError::Network(e.to_string()))?;
+-
+             transfer
+                 .header_function(|header| {
+                     if let Ok(line) = std::str::from_utf8(header) {
+@@ -226,7 +258,6 @@ impl CurlBlockingTransport {
+                     true
+                 })
+                 .map_err(|e| FsError::Network(e.to_string()))?;
+-
+             transfer
+                 .perform()
+                 .map_err(|e| FsError::Network(e.to_string()))?;
+@@ -240,59 +271,55 @@ impl CurlBlockingTransport {
+             .and_then(|v| v.parse::<u64>().ok());
+         let content_range = headers
+             .get("content-range")
+-            .and_then(|value| parse_content_range(value));
++            .and_then(|v| parse_content_range(v));
++        let retry_after_secs = headers
++            .get("retry-after")
++            .and_then(|v| parse_retry_after(v));
+ 
+         Ok(HttpResponse {
+             data,
+             status,
+             content_length,
+             content_range,
++            retry_after_secs,
+         })
+     }
+ }
+ 
+ #[cfg(all(not(feature = "reqwest"), feature = "curl"))]
+-impl BlockingHttp for CurlBlockingTransport {
+-    fn get_content_length(&self, url: &str) -> Result<Option<u64>> {
+-        let response = self.request(url, true, None)?;
+-        if (200..300).contains(&response.status) {
+-            return Ok(response.content_length);
++#[async_trait::async_trait]
++impl AsyncHttp for CurlAsyncTransport {
++    async fn get_content_length(&self, url: &str) -> Result<Option<u64>> {
++        let url = url.to_string();
++        let ct = self.connect_timeout;
++        let rt = self.read_timeout;
++        let resp = tokio::task::spawn_blocking(move || Self::do_request(url, true, None, ct, rt))
++            .await
++            .map_err(|e| FsError::Network(e.to_string()))??;
++
++        if (200..300).contains(&resp.status) {
++            Ok(resp.content_length)
++        } else {
++            Ok(None)
+         }
+-        Ok(None)
+     }
+ 
+-    fn get_range(&self, url: &str, start: u64, end: u64) -> Result<HttpResponse> {
+-        let response = self.request(url, false, Some((start, end)))?;
+-
+-        if response.status == 416 {
+-            return Ok(HttpResponse {
+-                data: Vec::new(),
+-                status: response.status,
+-                content_length: response.content_length,
+-                content_range: response.content_range,
+-            });
+-        }
+-
+-        if response.status == 200 {
+-            return Err(FsError::Protocol(
+-                "Server does not support Range requests (returned 200 instead of 206). \
+-                 This library requires strict Range semantics."
+-                    .into(),
+-            ));
+-        }
+-
+-        if response.status != 206 {
+-            return Err(FsError::Network(format!("HTTP error: {}", response.status)));
+-        }
+-
+-        if let Some((resp_start, _)) = response.content_range
+-            && resp_start != start
+-        {
+-            return Err(FsError::Protocol(
+-                "Server returned incorrect range start".into(),
+-            ));
+-        }
+-
+-        Ok(response)
++    async fn get_range(&self, url: &str, start: u64, end: u64) -> Result<HttpResponse> {
++        let url = url.to_string();
++        let ct = self.connect_timeout;
++        let rt = self.read_timeout;
++        let resp = tokio::task::spawn_blocking(move || {
++            Self::do_request(url, false, Some((start, end)), ct, rt)
++        })
++        .await
++        .map_err(|e| FsError::Network(e.to_string()))??;
++
++        validate_range_response(
++            resp.status,
++            resp.content_range,
++            start,
++            resp.retry_after_secs,
++        )?;
++        Ok(resp)
+     }
+ }
