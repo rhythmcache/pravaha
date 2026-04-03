@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -67,10 +68,6 @@ struct ChunkKey {
     start: u64,
 }
 
-//  The DashMap stores InFlight entries.  Once the future resolves the data goes
-//  into the LRU cache and the InFlight entry is removed.  Any number of waiters
-//  can clone + await the same SharedFuture without duplicating the HTTP request.
-
 type ChunkFuture = Shared<BoxFuture<'static, Result<Arc<[u8]>>>>;
 
 struct LruCache {
@@ -97,7 +94,6 @@ impl LruCache {
             return None;
         }
         let data = self.map.get(key)?.clone();
-        // Move to front.
         if let Some(pos) = self.lru.iter().position(|k| k == key) {
             self.lru.remove(pos);
         }
@@ -140,16 +136,17 @@ impl LruCache {
 pub(crate) struct FetchEngine {
     transport: Arc<dyn AsyncHttp>,
     config: HttpConfig,
-    /// In-flight futures, multiple readers share the same future.
     in_flight: Arc<DashMap<ChunkKey, ChunkFuture>>,
-    /// Completed chunks.
     lru: Arc<std::sync::Mutex<LruCache>>,
-    /// Bounds the number of simultaneous outgoing HTTP requests.
     semaphore: Arc<Semaphore>,
+    /// Runtime handle used for spawning prefetch tasks. Stored here so that
+    /// prefetch_ahead works correctly when called from plain OS threads
+    /// (e.g. via read_at) that have no Tokio context of their own.
+    rt: Handle,
 }
 
 impl FetchEngine {
-    fn new(transport: Arc<dyn AsyncHttp>, config: HttpConfig) -> Self {
+    fn new(transport: Arc<dyn AsyncHttp>, config: HttpConfig, rt: Handle) -> Self {
         let sem = Arc::new(Semaphore::new(config.max_parallel_fetches));
         let lru = Arc::new(std::sync::Mutex::new(LruCache::new(
             config.cache_max_entries,
@@ -161,32 +158,27 @@ impl FetchEngine {
             in_flight: Arc::new(DashMap::new()),
             lru,
             semaphore: sem,
+            rt,
         }
     }
 
-    /// Returns a future that resolves to the chunk data.
-    /// Deduplicates: if a fetch for this chunk is already running, returns
-    /// the same shared future instead of starting a new request.
     fn get_chunk(&self, url: Arc<str>, start: u64) -> ChunkFuture {
         let key = ChunkKey {
             url: Arc::clone(&url),
             start,
         };
 
-        // Fast path already in completed cache.
         if let Ok(mut lru) = self.lru.lock()
             && let Some(data) = lru.get(&key)
         {
             return futures::future::ready(Ok(data)).boxed().shared();
         }
 
-        // In-flight deduplication.
         use dashmap::mapref::entry::Entry;
 
         match self.in_flight.entry(key.clone()) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(v) => {
-                // Build the future only if we won the race.
                 let transport = Arc::clone(&self.transport);
                 let in_flight = Arc::clone(&self.in_flight);
                 let lru = Arc::clone(&self.lru);
@@ -197,7 +189,6 @@ impl FetchEngine {
                 let url2 = Arc::clone(&url);
 
                 let fut: BoxFuture<'static, Result<Arc<[u8]>>> = Box::pin(async move {
-                    // Acquire concurrency permit before touching the network.
                     let _permit = sem
                         .acquire()
                         .await
@@ -208,8 +199,6 @@ impl FetchEngine {
                         fetch_with_retry(&transport, &url2, start, range_end, &config).await?;
 
                     if data.is_empty() && start > 0 {
-                        // A 416 would have been caught by validate_range_response already.
-                        // An empty body for a non-zero start is a protocol violation.
                         return Err(FsError::Protocol(format!(
                             "Server returned empty body for range {start}-{range_end}"
                         )));
@@ -225,7 +214,6 @@ impl FetchEngine {
 
                     let arc: Arc<[u8]> = data.into();
 
-                    // Promote to completed cache and remove from in-flight.
                     if let Ok(mut lru) = lru.lock() {
                         lru.insert(key2.clone(), Arc::clone(&arc));
                     }
@@ -241,14 +229,14 @@ impl FetchEngine {
     }
 
     /// Kick off prefetch futures for the next `n` chunks without awaiting them.
+    /// Uses `self.rt.spawn` so this is safe to call from any thread, including
+    /// plain OS threads with no active Tokio context (e.g. from read_at).
     fn prefetch_ahead(&self, url: Arc<str>, from_offset: u64, n: usize, token: CancellationToken) {
         for i in 0..n as u64 {
             let start = from_offset + i * self.config.chunk_size;
-            // get_chunk registers the shared future in in_flight; we don't await.
             let fut = self.get_chunk(Arc::clone(&url), start);
             let token = token.clone();
-            // Drive the future on the Tokio runtime without blocking the caller.
-            tokio::spawn(async move {
+            self.rt.spawn(async move {
                 tokio::select! {
                     _ = fut => {}
                     _ = token.cancelled() => {}
@@ -340,9 +328,8 @@ pub struct HttpFile {
     file_offset: u64,
     eof_reached: bool,
     closed: bool,
-    /// Cached result of HEAD request.
-    cached_size: RwLock<Option<Option<u64>>>,
-    /// Whether the last read was sequential (used for prefetch decisions).
+    // OnceLock is Sync: written once (None→Some), never mutated after that.
+    cached_size: OnceLock<Option<u64>>,
     last_read_end: Option<u64>,
     cancel_token: CancellationToken,
 }
@@ -356,7 +343,7 @@ impl HttpFile {
             file_offset: 0,
             eof_reached: false,
             closed: false,
-            cached_size: RwLock::new(None),
+            cached_size: OnceLock::new(),
             last_read_end: None,
             cancel_token: CancellationToken::new(),
         }
@@ -367,44 +354,28 @@ impl HttpFile {
         (offset / cs) * cs
     }
 
-    /// Blocking read of a single chunk via the shared async engine.
     fn fetch_chunk(&self, start: u64) -> Result<Arc<[u8]>> {
         let fut = self.engine.get_chunk(Arc::clone(&self.url), start);
         block_sync(&self.rt, fut)?
     }
 
     fn fetch_size(&self) -> Option<u64> {
-        if let Some(val) = *self.cached_size.read().unwrap() {
-            return val;
+        if let Some(val) = self.cached_size.get() {
+            return *val;
         }
-
-        // Potential race here where multiple threads might call content_length.
-        // It's not a safety issue, but we can minimize redundant writes.
-        match block_sync(&self.rt, self.engine.content_length(self.url.as_ref())) {
-            Ok(Ok(val)) => {
-                let mut guard = self.cached_size.write().unwrap();
-                if let Some(existing) = *guard {
-                    return existing;
-                }
-                *guard = Some(val);
-                val
-            }
-            Ok(Err(_)) => {
-                let mut guard = self.cached_size.write().unwrap();
-                if let Some(existing) = *guard {
-                    return existing;
-                }
-                // cache the fact that server gave no Content-Length
-                *guard = Some(None);
-                None
-            }
+        let val = match block_sync(&self.rt, self.engine.content_length(self.url.as_ref())) {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => None,
             Err(e) => {
-                // runtime misconfiguration surface during dev, silent in release
                 #[cfg(debug_assertions)]
                 eprintln!("[pravaha] block_sync failed in fetch_size(): {e}");
                 None
             }
-        }
+        };
+        // OnceLock::set is a no-op if another thread raced us here — both
+        // threads computed the same value from the same HEAD response anyway.
+        let _ = self.cached_size.set(val);
+        val
     }
 }
 
@@ -442,7 +413,6 @@ impl File for HttpFile {
                 break;
             }
 
-            // Offset within this chunk.
             let inner = (self.file_offset - chunk_start) as usize;
             if inner >= chunk.len() {
                 self.eof_reached = true;
@@ -456,9 +426,8 @@ impl File for HttpFile {
             total_read += to_copy;
             self.file_offset += to_copy as u64;
 
-            // Check EOF against file size if known.
-            if let Some(Some(size)) = *self.cached_size.read().unwrap()
-                && self.file_offset >= size
+            if let Some(Some(size)) = self.cached_size.get()
+                && self.file_offset >= *size
             {
                 self.eof_reached = true;
                 break;
@@ -492,32 +461,40 @@ impl File for HttpFile {
         }
 
         let mut total = 0;
+
         while total < buf.len() {
             let chunk_start = self.chunk_start(offset);
             let chunk = self.fetch_chunk(chunk_start)?;
+
             if chunk.is_empty() {
                 break;
             }
+
             let inner = (offset - chunk_start) as usize;
             if inner >= chunk.len() {
                 break;
             }
+
             let available = &chunk[inner..];
             let to_copy = available.len().min(buf.len() - total);
             buf[total..total + to_copy].copy_from_slice(&available[..to_copy]);
+
             total += to_copy;
             offset += to_copy as u64;
         }
 
-        // Fire prefetch for the chunks immediately following this read.
-        // read_at has no sequential state so we always prefetch unconditionally.
-        let next_chunk = self.chunk_start(offset);
-        self.engine.prefetch_ahead(
-            Arc::clone(&self.url),
-            next_chunk,
-            self.engine.config.read_ahead_chunks,
-            self.cancel_token.clone(),
-        );
+        // Prefetch the chunks immediately following this read.
+        // Uses engine.rt.spawn internally so this is safe from any thread,
+        // including plain OS threads with no active Tokio context.
+        if total > 0 {
+            let next_chunk = self.chunk_start(offset);
+            self.engine.prefetch_ahead(
+                Arc::clone(&self.url),
+                next_chunk,
+                self.engine.config.read_ahead_chunks,
+                self.cancel_token.clone(),
+            );
+        }
 
         Ok(total)
     }
@@ -701,7 +678,13 @@ impl HttpFileSystemBuilder {
             .thread_name("pravaha-io")
             .build()
             .expect("Failed to build Tokio runtime");
-        let engine = Arc::new(FetchEngine::new(transport, self.config));
+        // Pass the handle to FetchEngine so prefetch_ahead can spawn tasks
+        // via self.rt.spawn regardless of the calling thread's context.
+        let engine = Arc::new(FetchEngine::new(
+            transport,
+            self.config,
+            rt.handle().clone(),
+        ));
         HttpFileSystem { engine, rt }
     }
 }
