@@ -9,6 +9,9 @@ let mut file = open("https://example.com/data.bin", OpenMode::Read)?;
 let mut buf = vec![0u8; 1024];
 file.read(&mut buf)?;
 file.seek(500)?;
+
+// Stateless positional read — no seek needed, safe to call concurrently
+file.read_at(1_000_000, &mut buf)?;
 ```
 
 ## Blocking behaviour
@@ -35,8 +38,8 @@ pravaha = { version = "0.1.1", default-features = false, features = ["reqwest"] 
 
 | Feature   | Default | Description                                               |
 |-----------|---------|-----------------------------------------------------------|
-| `curl`    |        | libcurl backend (blocking, executed via `spawn_blocking`) |
-| `reqwest` | ✓       | async reqwest backend (don't enable both)                 |
+| `curl`    | ✓       | libcurl backend (blocking, executed via `spawn_blocking`) |
+| `reqwest` |         | async reqwest backend (don't enable both)                 |
 | `capi`    |         | C ABI bindings + header generation                        |
 
 ## Usage
@@ -50,6 +53,8 @@ use pravaha::{open, File, OpenMode};
 
 let mut file = open("https://example.com/file.bin", OpenMode::Read)?;
 let mut buf = vec![0u8; 4096];
+
+// Stateful read — advances the internal cursor
 let n = file.read(&mut buf)?;
 
 // Seeking may trigger additional HTTP range requests
@@ -59,6 +64,10 @@ file.seek(1_000_000)?;
 if let Some(size) = file.size() {
     println!("File is {} bytes", size);
 }
+
+// Stateless positional read — does not move the cursor,
+// safe to call from multiple threads on the same handle.
+let n = file.read_at(2_000_000, &mut buf)?;
 ```
 
 ### Custom configuration
@@ -94,9 +103,37 @@ let file = open("https://example.com/archive.zip", OpenMode::Read)?;
 let mut archive = ZipArchive::new(FileAdapter::new(file))?;
 ```
 
+### Concurrent / parallel reads
+
+`read_at` is the preferred API for concurrent access. Because it takes `&self`
+and touches no internal cursor state, multiple threads can call it on the same
+handle simultaneously with no locking required on the caller's side:
+
+```rust
+use pravaha::{open, File, OpenMode};
+use std::sync::Arc;
+use std::thread;
+
+let file = Arc::new(open("https://example.com/large.bin", OpenMode::Read)?);
+
+let handles: Vec<_> = (0..4).map(|i| {
+    let f = Arc::clone(&file);
+    thread::spawn(move || {
+        let mut buf = vec![0u8; 1024 * 1024];
+        f.read_at(i * 64 * 1024 * 1024, &mut buf)
+    })
+}).collect();
+
+for h in handles { h.join().unwrap()?; }
+```
+
+The underlying engine deduplicates in-flight chunk requests, so two threads
+reading overlapping ranges will share one HTTP request rather than issuing two.
+
 ## C API
 
-Build with `--features capi` to generate C bindings and a pkg-config file. All C API calls are blocking, matching the Rust API behaviour. The C API accepts `"r"` or `"rb"` mode strings directly.
+Build with `--features capi` to generate C bindings and a pkg-config file.
+All C API calls are blocking, matching the Rust API behaviour.
 
 ```c
 #include "pravaha.h"
@@ -108,13 +145,17 @@ if (!file) {
 }
 
 char buf[4096];
+
+// Stateful read (advances cursor)
 ssize_t n = pravaha_read(file, buf, sizeof(buf));
+
+// Stateless positional read (does not move cursor, thread-safe)
+ssize_t m = pravaha_read_at(file, 1000000, buf, sizeof(buf));
 
 uint64_t pos;
 pravaha_tell(file, &pos);
 
-uint64_t size;
-int has_size;
+uint64_t size; int has_size;
 pravaha_size(file, &size, &has_size);
 
 pravaha_file_close(file);
@@ -126,50 +167,66 @@ For the full C API reference see [docs/c.md](docs/c.md).
 
 - Fetches data in configurable chunks (default 256 KB)
 - LRU cache for completed chunks (default 32 MB / 64 entries)
-- Speculative prefetch based on access pattern - triggered on sequential reads, skipped when reads are non-sequential; cancelled automatically when the file is closed
-- In-flight deduplication - concurrent reads on the same chunk share one HTTP request
+- Speculative prefetch based on access pattern - triggered on sequential reads via `read()`, skipped for non-sequential access, cancelled automatically when the file is closed
+- In-flight deduplication - concurrent reads on the same chunk share one HTTP request regardless of whether they use `read()` or `read_at()`
 - Exponential backoff retry on network errors; `Retry-After`-aware for 429/503 responses with a configurable retry cap
 - `HttpFile` implements `std::io::Read` and `Seek` directly
 
 ### Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│  Public sync API  (File / FileSystem traits) │
-│  HttpFile::read -> block_sync(engine.get_chunk)│
-└──────────────────┬───────────────────────────┘
-                   │
-┌──────────────────V───────────────────────────┐
-│  FetchEngine  (shared via Arc per FileSystem) │
-│                                              │
-│  DashMap<ChunkKey, SharedFuture>             │
-│    Missing -> spawn new fetch                │
-│    InFlight -> clone + await existing future  │
-│    Ready    -> LRU hit, wrap in ready future  │
-│                                              │
-│  Semaphore: caps concurrent HTTP requests    │
-└──────────────────┬───────────────────────────┘
-                   │
-┌──────────────────V───────────────────────────┐
-│  AsyncHttp transport (curl / reqwest)        │
-│  Retry · exponential backoff · 429/503 aware │
-└──────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Public sync API  (File / FileSystem traits)          │
+│                                                       │
+│  read(&mut self)      — stateful, advances cursor     │
+│  seek(&mut self)      — moves cursor                  │
+│  read_at(&self)       — stateless, cursor unchanged,  │
+│                         safe for concurrent callers   │
+│                                                       │
+│  All paths → block_sync(engine.get_chunk(...))        │
+└──────────────────────┬────────────────────────────────┘
+                       │
+┌──────────────────────V────────────────────────────────┐
+│  FetchEngine  (shared via Arc per FileSystem)         │
+│                                                       │
+│  DashMap<ChunkKey, SharedFuture>                      │
+│    Missing  → spawn new fetch                         │
+│    InFlight → clone + await existing future           │
+│    Ready    → LRU hit, wrap in ready future           │
+│                                                       │
+│  Semaphore: caps concurrent HTTP requests             │
+└──────────────────────┬────────────────────────────────┘
+                       │
+┌──────────────────────V────────────────────────────────┐
+│  AsyncHttp transport (curl / reqwest)                 │
+│  Retry · exponential backoff · 429/503 aware          │
+└───────────────────────────────────────────────────────┘
 ```
 
 ## Requirements
 
-- The server must support HTTP Range requests (RFC 7233). Pravaha returns a `Protocol` error if the server responds with `200 OK` instead of `206 Partial Content`.
-- Performance depends on server behaviour. Some servers throttle or limit parallel range requests, which reduces the benefit of concurrency.
+- The server must support HTTP Range requests (RFC 7233). Pravaha returns a
+  `Protocol` error if the server responds with `200 OK` instead of
+  `206 Partial Content`.
+- Performance depends on server behaviour. Some servers throttle or limit
+  parallel range requests, which reduces the benefit of concurrency.
 
 ## Thread safety
 
-- `HttpFileSystem` is `Send + Sync` - share one instance freely across threads.
-- `HttpFile` handles are `Send` - move to another thread safely.
-- `HttpFile` handles are not `Sync` - don't use one handle from multiple threads simultaneously.
+| Handle              | `Send` | `Sync` | Notes |
+|---------------------|--------|--------|-------|
+| `HttpFileSystem`    | ✓      | ✓      | Share freely across threads |
+| `HttpFile` (via `read` / `seek`) | ✓ | ✗ | Stateful — one thread at a time |
+| `HttpFile` (via `read_at`) | ✓ | ✓ | Stateless — concurrent calls are safe |
+
+In practice: wrap the file in an `Arc` and call `read_at` from as many threads
+as you like. If you also need stateful `read`/`seek`, add a `Mutex`.
 
 ## Memory budget
 
-With defaults: `max_parallel_fetches (4) x chunk_size (256 KB) = 1 MB` peak in-flight, plus up to 32 MB completed LRU cache. Tune conservatively for memory-constrained environments.
+With defaults: `max_parallel_fetches (4) × chunk_size (256 KB) = 1 MB` peak
+in-flight, plus up to 32 MB completed LRU cache. Tune conservatively for
+memory-constrained environments.
 
 ## License
 
