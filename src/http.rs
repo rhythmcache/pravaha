@@ -492,27 +492,32 @@ impl File for HttpFile {
         }
 
         let mut total = 0;
-
         while total < buf.len() {
             let chunk_start = self.chunk_start(offset);
             let chunk = self.fetch_chunk(chunk_start)?;
-
             if chunk.is_empty() {
                 break;
             }
-
             let inner = (offset - chunk_start) as usize;
             if inner >= chunk.len() {
                 break;
             }
-
             let available = &chunk[inner..];
             let to_copy = available.len().min(buf.len() - total);
             buf[total..total + to_copy].copy_from_slice(&available[..to_copy]);
-
             total += to_copy;
             offset += to_copy as u64;
         }
+
+        // Fire prefetch for the chunks immediately following this read.
+        // read_at has no sequential state so we always prefetch unconditionally.
+        let next_chunk = self.chunk_start(offset);
+        self.engine.prefetch_ahead(
+            Arc::clone(&self.url),
+            next_chunk,
+            self.engine.config.read_ahead_chunks,
+            self.cancel_token.clone(),
+        );
 
         Ok(total)
     }
